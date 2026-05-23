@@ -41,7 +41,7 @@ surface it rather than guessing.
   first run if absent. **Done when:** unit tests load a sample config and reject
   a duplicate-name and a malformed file with clear messages.
 
-- [ ] **T3 — incus helpers (`incus.py`).** `cli_run`/`cli_quiet`,
+- [x] **T3 — incus helpers (`incus.py`).** `cli_run`/`cli_quiet`,
   `container_exists`, device add/remove/show (single cached `device show`),
   `copy`, `launch`, `start`, idmap/apparmor/config set. incus-only (no LXD).
   **Done when:** a throwaway script can launch+delete a container and add/remove
@@ -175,3 +175,54 @@ coercion), duplicate-name reject, malformed-TOML reject, missing name/when,
 reserved `default`, invalid mode, missing path, invalid/negative durations,
 missing file, and `ensure_user_config` writes-defaults + idempotent-no-clobber
 (shipped default parses cleanly). Package import via editable install ✓.
+
+### 2026-05-23 — T3: incus helpers (`incus.py`)
+
+**Changed:** Implemented `incus.py` — a pure *mechanism* layer over the `incus`
+binary (no policy: callers supply image/mappings/devices). Public surface:
+`IncusError`; `cli_run` (streamed, returns rc) / `cli_quiet` (captured, returns
+stdout) with `check`/`stdin_text`; `instance_info` / `container_exists` /
+`is_running`; `launch` / `start` / `stop` / `delete` / `copy`; `exec_`;
+`device_show` / `device_exists` / `device_add` / `device_remove` /
+`invalidate_cache`; `config_set` / `config_get` / `set_idmap` / `set_apparmor`.
+
+**Decisions / gotchas for next tasks:**
+- **State queries go through `incus query /1.0/instances/<name>`** (REST → JSON),
+  *not* `incus config device show` (YAML). Rationale: stdlib `json` only — the
+  package is zero-dep by design (pyproject `dependencies = []`), so no PyYAML.
+  `instance_info(name)` returns the parsed dict or `None` if absent; it uses the
+  instance's **local** `devices` (not `expanded_devices`), which is what
+  idempotent per-instance device-adds need to check. T4/T8: build on this.
+- **`device_show` is process-cached** per container name (one daemon call),
+  invalidated by `device_add`/`device_remove`/`delete` (and `invalidate_cache`).
+  This is the §15.2 "≤ ~3 daemon calls" lever — the run path can check several
+  candidate devices for one query. Pass `refresh=True` to force a re-query.
+- **`exec_` keys off the numeric UID** via `--user` (DESIGN §3 — the possibly-`@`
+  username never touches the exec path). Signature:
+  `exec_(name, [argv...], uid=, cwd=, env=, capture=, check=, stdin_text=)`.
+  `command` is a **list** (argv). T4 provisioning will lean on this heavily
+  (e.g. `exec_(base, ["bash","-c", script], uid=0, stdin_text=...)`).
+- **I added `exec_`, `stop`, `is_running` beyond the T3 enum** (cli_run/quiet,
+  exists, device add/remove/show, copy, launch, start, idmap/apparmor/config
+  set). They're pure mechanism squarely in incus.py's charter and the next tasks
+  need them; no policy pulled forward.
+- **bool→`"true"/"false"`** conversion in `_prop` for config/device values
+  (e.g. `device_add(..., readonly=True)`). Numbers → `str`.
+- **`set_idmap`/`set_apparmor`** are thin `config_set` wrappers; the *exact*
+  mapping string (`"both <uid> 1000"` etc.) and apparmor rules are T4's policy.
+- **Missing binary** → `IncusError` with the Ubuntu package hint. `delete`/
+  `device_remove` accept `check=False` for best-effort cleanup (used by reaper/
+  rebuild). `delete --force` and `stop --force` by default.
+- **No unit tests for incus.py** — it's all I/O against the daemon; verified by a
+  throwaway script per the Done-when (not committed). Real unit-testable logic
+  lives in `mounts.py` (T6/T7).
+
+**Verified:** Threw a real `images:alpine/3.21` container through every helper
+(launch → exists/running → instance_info → config set/get → exec capture →
+device add/show/exists/remove with verified bind-mount visibility *inside* the
+container + cache-hit then refresh-requery → stop → CoW `copy` (confirmed the
+copy is **stopped**, never started) → delete copy → delete primary → confirm
+gone): **20/20 checks passed, 0 leftover containers**. `pytest -q` → 20 passed
+(no regression). Note: `images:alpine/3.20` doesn't exist on the remote; the
+current alias is `alpine/3.21` (irrelevant to T4, which uses `images:ubuntu/24.04`
+= the `ubuntu/noble` container variant, confirmed present in the remote).
