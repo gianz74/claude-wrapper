@@ -32,7 +32,7 @@ surface it rather than guessing.
   passthrough stub with `-p hi`; `claude-wrapper --mount /x -- --foo` parses
   `/x` as a mount and `--foo` as passthrough.
 
-- [ ] **T2 — Config loader + validation (`config.py`).** Load
+- [x] **T2 — Config loader + validation (`config.py`).** Load
   `~/.config/claude-wrapper/config.toml` via `tomllib`; model `[setup]`,
   `[reaper]`, `[[mounts]]` (path/from/mode/exclude), `[[contexts]]`
   (name/when[list]/provision_script/mounts) per DESIGN §7. Validate: required
@@ -133,3 +133,45 @@ stubs annotated with the task that fills them.
 `claude-wrapper --mount /x -- --foo` → mount `('/x','rw')`, passthrough
 `['--foo']` ✓. Bonus: `--mount /y:ro chat --resume` → mount `('/y','ro')`,
 passthrough `['chat','--resume']` ✓.
+
+### 2026-05-23 — T2: Config loader + validation (`config.py`)
+
+**Changed:** Implemented `config.py` (host-only; pure stdlib `tomllib`, no
+sandbox needed). Frozen dataclasses: `Config{setup,reaper,mounts,contexts}`,
+`SetupConfig{packages,provision_script}`, `ReaperConfig{stop_idle_after,
+delete_unused_after,max_instances}` (durations parsed → **int seconds**),
+`MountSpec{path,from_,mode,exclude}`, `Context{name,when,provision_script,
+mounts}`. Public API: `parse_config(dict)` (pure, testable), `load_config(path)`
+(file → Config), `ensure_user_config(dir=None)` (writes default config.toml +
+provision.sh on first run, idempotent, never clobbers), `load_user_config()`
+(= load_config(ensure_user_config())). All errors raise `ConfigError` with a
+locatable message. Added `tests/test_config.py` (20 tests).
+
+**Decisions / gotchas for next tasks:**
+- **Naming:** config mount type is `MountSpec` (path/from_/mode/exclude) — do
+  NOT confuse with `cli.Mount` (the ad-hoc `--mount` NamedTuple, path/mode only).
+- **`from` is a Python keyword** → field is `from_`; read from TOML via
+  `raw.get("from")`. Helpers: `m.host_path` (= `from_` or `path`, the host
+  backing) and `m.is_alias`. T6 refuse-guard keys off alias `from_`/`path`.
+- **All host paths are `~`-expanded at load time** (`path`, `from`, `when`,
+  `provision_script`). `exclude` entries are **left relative** (sub-paths under
+  the mount `path`) — T7 masking must join them onto `path`.
+- **Durations** stored as **int seconds** (`"30m"`→1800, `"14d"`→1209600, bare
+  int = seconds). T10 reaper consumes seconds directly.
+- **Validation enforced:** required context `name` + non-empty `when` (a bare
+  string is coerced to a 1-element list); duplicate names → error; `default` is
+  **reserved** (it's the no-context fallback per §6, so a config can't claim it);
+  mode ∈ {ro,rw}; mount needs `path`; `max_instances` ≥ 0; malformed
+  TOML/duration → clear `ConfigError`.
+- `SCHEMA_VERSION = 1` is exported — fold it into the T8/T10 stamp hash (§10).
+- Default config ships `~/.claude` + `~/.claude.json` as global mounts
+  (essential shared auth/history per §10); everything else commented as examples.
+- Not yet wired into `cli.py` (subcommands are still T1 stubs); integration
+  happens in T4/T8 when setup/run actually load config.
+
+**Verified:** `python3 -m pytest -q` → **20 passed**. Covers: sample-config
+load (incl. ~ expansion, alias host_path, duration parsing, string→list `when`
+coercion), duplicate-name reject, malformed-TOML reject, missing name/when,
+reserved `default`, invalid mode, missing path, invalid/negative durations,
+missing file, and `ensure_user_config` writes-defaults + idempotent-no-clobber
+(shipped default parses cleanly). Package import via editable install ✓.
