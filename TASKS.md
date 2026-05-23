@@ -90,7 +90,7 @@ surface it rather than guessing.
   buffer under a context) and §15.9 (two contexts concurrently, no `~/.ssh`
   collision) pass.
 
-- [ ] **T10 — Reaper + gc + delete (`lifecycle.py`).** Leave-running + amortized
+- [x] **T10 — Reaper + gc + delete (`lifecycle.py`).** Leave-running + amortized
   background reap (local `last-reap` stamp, >1h → background pass), `[reaper]`
   thresholds (stop_idle/delete_unused/max_instances via `user.last-used`), `gc`
   subcommand, `delete [name]` (one context vs all, `[y/N]`). **Done when:**
@@ -615,3 +615,88 @@ interactively):** §15.8's actual Emacs + claude-code-ide WebSocket *handshake*
 verified above; to confirm the live handshake, open an Emacs project buffer
 under a context and check `claude-code-ide` connects. §15.9 likewise verified
 mechanically; a true dual-IDE session would be the final human check.
+
+### 2026-05-23 — T10: Reaper + gc + delete (`lifecycle.py`)
+
+**Design decision (user-approved):** the reaper keys off `user.last-used`, which
+is bumped only **at launch** (§10). A long live session therefore has a stale
+last-used, so a concurrent `gc`/background-reap would `stop --force` it
+mid-work. "Always safe — instances hold no unique state" justifies *deletion*
+(files live on host bind-mounts) but **not** killing a live TUI. Resolution
+(user chose "skip live sessions"): a **liveness guard** — the reaper never
+stops/deletes a *running* instance that still has a live `claude` process; the
+session's own next run re-stamps last-used, so it ages out only once actually
+idle. Off the hot path, so the extra probe cost is fine; doesn't affect §15.10
+(which exercises an *exited* session).
+
+**Changed (`lifecycle.py`):**
+- Pure decision core `plan_reap(instances, reaper, now) -> ReapPlan(stop, delete)`
+  (no I/O — unit-tested): phase 1 delete unused past `delete_unused_after`;
+  phase 2 stop *running* survivors idle past `stop_idle_after`; phase 3 LRU-trim
+  survivors beyond `max_instances` (oldest by last-used first). A **0 threshold
+  disables its phase** (matches `max_instances=0`=unlimited; avoids the
+  always-true-age footgun). Delete wins over stop on overlap.
+- Executor `reap(cfg) -> ReapResult(stopped, deleted, skipped_live)`: one
+  `list_instances()` call → `_tier3_instances()` (filters `user.cw-role=instance`)
+  → `plan_reap` → execute, applying the **liveness guard** (`_has_live_session`)
+  to running candidates only.
+- `_has_live_session(name)`: dependency-free `/proc` scan for a process whose
+  `comm` is `claude` (`sh -c 'for c in /proc/[0-9]*/comm; …'`, run as uid 0) —
+  **no pgrep/procps needed** in the base image. Verified: a process exec'd from
+  a binary named `claude` reports comm `claude`.
+- `gc(cfg=None)`: foreground pass + writes the reap stamp + prints a summary.
+- `delete_containers(name=None, *, assume_yes)`: no name → base + all
+  role-tagged templates/instances (`[y/N]`), then **clears the config stamp** so
+  the next run auto-`setup`s; a name → that context's `claude-sandbox-<name>`
+  template + its `cw-context`-tagged instances only (base/other contexts
+  untouched, **no** stamp clear). Confirmation on both modes; `-y/--yes` skips.
+- Amortized background reap: `_reap_due()`/`_read`/`_write_reap_stamp` (stamp =
+  `last-reap` in the same `_state_dir()` as T8's config stamp). `run()` calls
+  `_maybe_background_reap()` right after the last-used bump — it **claims the
+  slot** (writes the stamp) then spawns a **detached** `python -c
+  "…_reap_main()"` (`start_new_session`, std streams → DEVNULL). `_reap_main()`
+  loads config + reaps, swallowing all errors (silent best-effort).
+- `setup()` now runs a closing `reap(cfg)` + writes the reap stamp (§9 "run gc").
+
+**Changed (`cli.py`):** `cmd_gc` → `lifecycle.gc()`; `cmd_delete` parses optional
+`<name>` + `-y/--yes` → `lifecycle.delete_containers(...)`; both catch
+`ConfigError`/`SetupError`/`IncusError` → stderr + rc 1 (bad option/too many args
+→ rc 2). Added `tests/test_lifecycle_reaper.py` (20 tests).
+
+**Decisions / gotchas (project is now feature-complete — T1–T10 done):**
+- **§15.2 budget preserved:** `_maybe_background_reap` does **zero** daemon calls
+  on the hot path — only a local stamp read, and (when stale) a stamp write +
+  `Popen` (neither is a daemon call). When the stamp is fresh (the §15.2 "2nd
+  launch" case) it's a pure no-op, so the warm path is still exactly 3 daemon
+  calls. The detached child's calls run in a separate process. **Keep this** if
+  anything else is ever added to the run path.
+- **`-y/--yes` on `delete` is an addition** beyond the §9 surface (the design
+  only specifies `[y/N]`). Justified for scripting/cleanup and it's the
+  conventional flag; the interactive default is still confirm. Named-mode delete
+  also confirms (design only mandated it for delete-all) — cheap safety, and a
+  delete is reversible via `setup` anyway.
+- **`max_instances` LRU + a skipped live session:** if the oldest-beyond-cap
+  instance is live, the guard skips it, so a pass may not fully reach the cap;
+  the next pass retries. Accepted (can't kill a live session to satisfy a count).
+- **Orphan handling:** a tier-3 instance with a missing/garbage `user.last-used`
+  reads as epoch 0 → ancient → deleted by the `delete_unused_after` phase. This
+  is the intended "stale/orphan" cleanup `gc` is for.
+- The CLI subcommand set (`setup`/`delete`/`gc`) and run path are unchanged from
+  T1's dispatch; T10 only filled the `delete`/`gc` stubs.
+
+**Verified:** `pytest -q` → **109 passed** (89 prior + 20 new). Throwaway
+integration run against the real daemon (hermetic temp `XDG_STATE_HOME`, all
+instances CoW'd from the existing `claude-base`; **25/25 checks**): liveness
+probe true/false correct; an idle running instance was **stopped** while a
+**live-claude instance was left Running** (guard) and reported `skipped_live`;
+an unused instance past `delete_unused_after` was **deleted**; LRU trim with
+`max_instances=2` deleted **exactly the oldest** of three and kept the two
+newest; `delete t10ctx` removed that context's template + instance and **left a
+different context's instance untouched**; `delete` (all, BASE pointed at a
+throwaway copy) removed base + templates + instances, **cleared the config
+stamp**, and **left the real `claude-base` intact**; reap-due gate false when
+fresh / true when stale. All throwaways cleaned up; `incus list` shows only
+`claude-base` STOPPED. **Not exercised here:** the live background-reap *spawn*
+during a real interactive session (the gate + `reap()` it would call are both
+verified; the `Popen` is trivial) and a wall-clock-aged reap (last-used is
+seeded directly, which is equivalent).

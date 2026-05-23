@@ -4,9 +4,11 @@ This module owns the *internal* (mechanism) provisioning — identity rename,
 idmap, apparmor, DNS-wait, claude install — and the tier orchestration.
 
 * ``build_base`` (T4) — build the frozen tier-1 ``claude-base`` per §3/§11/§12.
-* ``setup`` (T4) — the ``setup`` subcommand entry point; T5 extends it with
-  ``build_templates`` + context pruning, T8/T10 with the stamp + reaper.
-* ``build_templates`` (T5), ``run`` + stamp drift (T8), reaper/gc/delete (T10).
+* ``setup`` (T4) — the ``setup`` subcommand entry point; extended with
+  ``build_templates`` + context pruning (T5), the config stamp (T8), and a
+  closing reaper pass (T10).
+* ``build_templates`` (T5), ``run`` + stamp drift (T8).
+* ``reap`` / ``gc`` / ``delete_containers`` + amortized background reap (T10).
 """
 
 from __future__ import annotations
@@ -16,7 +18,10 @@ import json
 import os
 import re
 import signal
+import subprocess
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +31,7 @@ from .config import (
     Config,
     Context,
     MountSpec,
+    ReaperConfig,
     ensure_user_config,
     load_config,
 )
@@ -444,9 +450,9 @@ def build_templates(cfg: Config) -> None:
 def setup(cfg: Config | None = None) -> int:
     """The ``setup`` subcommand: unconditional, idempotent full provision.
 
-    Builds the base (T4), the context templates + prunes removed ones (T5), and
-    writes the config stamp (T8) so the next normal run takes the fast path. The
-    reaper pass is T10.
+    Builds the base (T4), the context templates + prunes removed ones (T5),
+    writes the config stamp (T8) so the next normal run takes the fast path, and
+    runs a closing reaper pass over existing instances (T10, DESIGN §9).
     """
     config_path = ensure_user_config()
     if cfg is None:
@@ -458,9 +464,11 @@ def setup(cfg: Config | None = None) -> int:
     build_base(cfg, host_user=host_user, host_uid=host_uid, host_gid=host_gid, home=home)
     build_templates(cfg)
     _write_stamp(_config_stamp(config_path))
+    result = reap(cfg)
+    _write_reap_stamp(int(time.time()))
     n = len(cfg.contexts)
-    print(f"setup: base + {n} context template(s) complete; stamp written. "
-          "(reaper lands in T10.)")
+    print(f"setup: base + {n} context template(s) complete; stamp written"
+          f"{result.summary_suffix()}.")
     return 0
 
 
@@ -508,6 +516,44 @@ def _write_stamp(value: str) -> None:
     p = _stamp_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(value + "\n")
+
+
+def _clear_stamp() -> None:
+    """Remove the config stamp so the next run auto-``setup``s (used by delete)."""
+    try:
+        _stamp_path().unlink()
+    except OSError:
+        pass
+
+
+# Amortized background-reap cadence (DESIGN §10): the run path triggers a
+# background pass at most this often, gated by a local stamp (no daemon calls on
+# the hot path). gc/setup run a pass unconditionally.
+REAP_INTERVAL_S = 3600
+
+
+def _reap_stamp_path() -> Path:
+    return _state_dir() / "last-reap"
+
+
+def _read_reap_stamp() -> int | None:
+    try:
+        return int(_reap_stamp_path().read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_reap_stamp(epoch: int) -> None:
+    p = _reap_stamp_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"{epoch}\n")
+
+
+def _reap_due(now: int | None = None) -> bool:
+    """True if no reap has run within ``REAP_INTERVAL_S`` (or ever)."""
+    now = int(time.time()) if now is None else now
+    last = _read_reap_stamp()
+    return last is None or (now - last) > REAP_INTERVAL_S
 
 
 # Host env forwarded into the exec. Terminal/locale so the TUI renders right;
@@ -651,6 +697,11 @@ def run(session_mounts: "list[Mount]", passthrough: list[str]) -> int:
         with mcp.Bridge(instance, home=home) as bridge:
             argv = bridge.prepare(passthrough)
             incus.config_set(instance, LAST_USED_KEY, str(int(time.time())))
+            # Amortized background reap (§10): a local stamp check (no daemon
+            # calls) → detached pass while claude runs, so the hot path is
+            # untouched. This session's instance was just re-stamped, so it is
+            # never a reap target of its own pass.
+            _maybe_background_reap()
             return incus.exec_(
                 instance,
                 ["claude", *argv],
@@ -663,3 +714,293 @@ def run(session_mounts: "list[Mount]", passthrough: list[str]) -> int:
     finally:
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
+
+
+# --- reaper / gc / delete (DESIGN §9/§10) ------------------------------------
+
+
+@dataclass(frozen=True)
+class ReapPlan:
+    """Pure reaper decision (no I/O): which instances to stop vs. delete."""
+
+    stop: tuple[str, ...]    # running + idle past stop_idle_after
+    delete: tuple[str, ...]  # unused past delete_unused_after, or LRU-trimmed
+
+
+@dataclass(frozen=True)
+class ReapResult:
+    """What a reaper pass actually did (after the liveness guard)."""
+
+    stopped: tuple[str, ...] = ()
+    deleted: tuple[str, ...] = ()
+    skipped_live: tuple[str, ...] = ()  # left alone: a live claude session
+
+    def summary_suffix(self) -> str:
+        """`'; stopped N, deleted M'` (or `''` when nothing happened)."""
+        bits = []
+        if self.stopped:
+            bits.append(f"stopped {len(self.stopped)}")
+        if self.deleted:
+            bits.append(f"deleted {len(self.deleted)}")
+        return ("; reaper " + ", ".join(bits)) if bits else ""
+
+
+def _inst_name(inst: dict) -> str:
+    return inst.get("name", "")
+
+
+def _inst_status(inst: dict) -> str | None:
+    return inst.get("status")
+
+
+def _last_used_epoch(inst: dict) -> int:
+    """The instance's ``user.last-used`` as epoch seconds; 0 if absent/bad.
+
+    A missing tag sorts oldest and ages out fastest — an untagged orphan is
+    treated as long-unused, which is the cleanup we want.
+    """
+    try:
+        return int((inst.get("config") or {}).get(LAST_USED_KEY))
+    except (TypeError, ValueError):
+        return 0
+
+
+def plan_reap(instances: list[dict], reaper: ReaperConfig, now: int) -> ReapPlan:
+    """Decide stop/delete for tier-3 *instances* — pure, no daemon calls (§10).
+
+    Three phases over the instances (already filtered to ``role=instance``):
+
+    1. **delete** any unused longer than ``delete_unused_after``;
+    2. **stop** any *running* survivor idle longer than ``stop_idle_after``;
+    3. **LRU-trim**: if survivors exceed ``max_instances`` (>0), delete the
+       oldest (by ``last-used``) down to the cap.
+
+    A ``0`` threshold disables its phase (matches ``max_instances = 0`` =
+    unlimited, and avoids the footgun of an always-true age comparison). The
+    liveness guard that protects a running-but-live instance is applied by the
+    executor :func:`reap`, not here.
+    """
+    delete: list[str] = []
+    survivors: list[dict] = []
+    for inst in instances:
+        age = now - _last_used_epoch(inst)
+        if reaper.delete_unused_after > 0 and age > reaper.delete_unused_after:
+            delete.append(_inst_name(inst))
+        else:
+            survivors.append(inst)
+
+    stop: list[str] = []
+    for inst in survivors:
+        age = now - _last_used_epoch(inst)
+        if (_inst_status(inst) == "Running"
+                and reaper.stop_idle_after > 0
+                and age > reaper.stop_idle_after):
+            stop.append(_inst_name(inst))
+
+    if reaper.max_instances > 0 and len(survivors) > reaper.max_instances:
+        oldest_first = sorted(survivors, key=_last_used_epoch)
+        excess = len(survivors) - reaper.max_instances
+        delete.extend(_inst_name(i) for i in oldest_first[:excess])
+
+    # Delete wins over stop for any instance caught by both phases.
+    delete_unique = tuple(dict.fromkeys(delete))
+    delete_set = set(delete_unique)
+    return ReapPlan(
+        stop=tuple(n for n in stop if n not in delete_set),
+        delete=delete_unique,
+    )
+
+
+# Dependency-free liveness probe: scan /proc for a process whose comm is
+# `claude`. Avoids a procps dependency and works on the minimal base image.
+_LIVE_CHECK = (
+    r'for c in /proc/[0-9]*/comm; do '
+    r'IFS= read -r n < "$c" 2>/dev/null && [ "$n" = claude ] && '
+    r'{ echo live; exit 0; }; '
+    r'done; exit 1'
+)
+
+
+def _has_live_session(name: str) -> bool:
+    """True if a ``claude`` process is alive inside running instance *name*.
+
+    The reaper never stops/deletes an instance with a live session (the user
+    chose this guard): the session's own run re-stamps ``last-used``, so it ages
+    out only once it actually goes idle. Probes via ``/proc`` so no in-image
+    tooling (pgrep/procps) is required.
+    """
+    out = incus.exec_(name, ["sh", "-c", _LIVE_CHECK], uid=0, capture=True, check=False)
+    return isinstance(out, str) and out.strip() == "live"
+
+
+def _tier3_instances() -> list[dict]:
+    """Every tier-3 instance (``user.cw-role=instance``) as a REST object."""
+    return [
+        i for i in incus.list_instances()
+        if (i.get("config") or {}).get(ROLE_KEY) == "instance"
+    ]
+
+
+def reap(cfg: Config) -> ReapResult:
+    """Run one reaper pass (DESIGN §10), honouring the live-session guard.
+
+    Enumerates tier-3 instances in one listing call, plans stop/delete with
+    :func:`plan_reap`, then executes — skipping any *running* instance that
+    still has a live claude session. Always safe: instances hold no unique
+    state, and a skipped live one is re-evaluated next pass.
+    """
+    now = int(time.time())
+    instances = _tier3_instances()
+    plan = plan_reap(instances, cfg.reaper, now)
+    by_name = {_inst_name(i): i for i in instances}
+
+    deleted: list[str] = []
+    stopped: list[str] = []
+    skipped: list[str] = []
+
+    for name in plan.delete:
+        inst = by_name.get(name)
+        if inst is not None and _inst_status(inst) == "Running" and _has_live_session(name):
+            skipped.append(name)
+            continue
+        print(f"gc: deleting unused instance {name}...")
+        incus.delete(name, check=False)
+        deleted.append(name)
+
+    for name in plan.stop:
+        if _has_live_session(name):  # running by construction
+            skipped.append(name)
+            continue
+        print(f"gc: stopping idle instance {name}...")
+        incus.stop(name)
+        stopped.append(name)
+
+    return ReapResult(
+        stopped=tuple(stopped),
+        deleted=tuple(deleted),
+        skipped_live=tuple(dict.fromkeys(skipped)),
+    )
+
+
+def _maybe_background_reap() -> None:
+    """Spawn a detached reap pass if one is due (DESIGN §10) — hot-path safe.
+
+    Reads only a local stamp (no daemon calls); claims the slot by writing the
+    stamp *before* spawning so concurrent/back-to-back runs don't pile on. The
+    child runs in its own session with its std streams discarded, so it survives
+    this process and never touches the terminal.
+    """
+    if not _reap_due():
+        return
+    _write_reap_stamp(int(time.time()))
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c",
+             "from claude_wrapper.lifecycle import _reap_main; _reap_main()"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass  # best-effort background work; next run retries
+
+
+def _reap_main() -> None:
+    """Entry point for the detached background reap (see :func:`_maybe_background_reap`)."""
+    try:
+        reap(load_config(ensure_user_config()))
+    except Exception:
+        pass  # detached + silent: a failed pass just defers to the next one
+
+
+def gc(cfg: Config | None = None) -> int:
+    """The ``gc`` subcommand: a foreground reaper pass across all instances (§9)."""
+    if cfg is None:
+        cfg = load_config(ensure_user_config())
+    result = reap(cfg)
+    _write_reap_stamp(int(time.time()))
+    if not (result.stopped or result.deleted):
+        print("gc: nothing to reap.")
+    else:
+        print(f"gc: stopped {len(result.stopped)}, deleted {len(result.deleted)} "
+              f"instance(s).")
+    if result.skipped_live:
+        print(f"gc: left {len(result.skipped_live)} live session(s) running.")
+    return 0
+
+
+def _confirm(prompt: str, *, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _ours_for_delete_all(instances: list[dict]) -> list[str]:
+    """Base + every tier-2 template + tier-3 instance, in deletion order."""
+    targets: list[str] = []
+    if incus.container_exists(BASE):
+        targets.append(BASE)
+    targets += [
+        _inst_name(i) for i in instances
+        if (i.get("config") or {}).get(ROLE_KEY) in ("template", "instance")
+    ]
+    return list(dict.fromkeys(targets))
+
+
+def delete_containers(name: str | None = None, *, assume_yes: bool = False) -> int:
+    """The ``delete`` subcommand (DESIGN §9).
+
+    No *name* → base + all templates + all instances (``[y/N]`` confirm), then
+    clear the config stamp so the next run re-``setup``s. A *name* → that
+    context's tier-2 template + its tier-3 instances only (base and other
+    contexts untouched). Always safe — containers hold no unique state.
+    """
+    instances = incus.list_instances()
+
+    if name is None:
+        targets = _ours_for_delete_all(instances)
+        if not targets:
+            print("delete: no claude-wrapper containers found.")
+            return 0
+        if not _confirm(
+            f"Delete ALL {len(targets)} claude-wrapper container(s) "
+            "(base + templates + instances)?",
+            assume_yes=assume_yes,
+        ):
+            print("Aborted.")
+            return 1
+        for t in targets:
+            print(f"Deleting {t}...")
+            incus.delete(t, check=False)
+        _clear_stamp()
+        print(f"Deleted {len(targets)} container(s). "
+              "Run `claude-wrapper setup` to rebuild.")
+        return 0
+
+    template = _template_name(name)
+    targets = [template] if incus.container_exists(template) else []
+    targets += [
+        _inst_name(i) for i in instances
+        if (i.get("config") or {}).get(ROLE_KEY) == "instance"
+        and (i.get("config") or {}).get(CONTEXT_KEY) == name
+    ]
+    targets = list(dict.fromkeys(targets))
+    if not targets:
+        print(f"delete: nothing found for context {name!r}.")
+        return 0
+    if not _confirm(
+        f"Delete context {name!r}: {len(targets)} container(s) "
+        "(template + instances)?",
+        assume_yes=assume_yes,
+    ):
+        print("Aborted.")
+        return 1
+    for t in targets:
+        print(f"Deleting {t}...")
+        incus.delete(t, check=False)
+    print(f"Deleted {len(targets)} container(s) for context {name!r}.")
+    return 0

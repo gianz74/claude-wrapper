@@ -81,14 +81,40 @@ def cmd_setup(args: list[str]) -> int:
 
 
 def cmd_delete(args: list[str]) -> int:
-    target = args[0] if args else "(all)"
-    print(f"claude-wrapper delete {target}: not implemented")
-    return 0
+    """``delete [-y] [<name>]`` — remove all containers, or one context's.
+
+    ``-y``/``--yes`` skips the confirmation prompt (handy for scripts/cleanup).
+    """
+    from . import config, incus, lifecycle
+
+    assume_yes = False
+    name: str | None = None
+    for a in args:
+        if a in ("-y", "--yes"):
+            assume_yes = True
+        elif a.startswith("-"):
+            print(f"claude-wrapper delete: unknown option {a!r}", file=sys.stderr)
+            return 2
+        elif name is None:
+            name = a
+        else:
+            print("claude-wrapper delete: too many arguments", file=sys.stderr)
+            return 2
+    try:
+        return lifecycle.delete_containers(name, assume_yes=assume_yes)
+    except (config.ConfigError, lifecycle.SetupError, incus.IncusError) as e:
+        print(f"claude-wrapper delete: {e}", file=sys.stderr)
+        return 1
 
 
 def cmd_gc(args: list[str]) -> int:
-    print("claude-wrapper gc: not implemented")
-    return 0
+    from . import config, incus, lifecycle
+
+    try:
+        return lifecycle.gc()
+    except (config.ConfigError, lifecycle.SetupError, incus.IncusError) as e:
+        print(f"claude-wrapper gc: {e}", file=sys.stderr)
+        return 1
 
 
 def run_passthrough(mounts: list[Mount], passthrough: list[str]) -> int:
