@@ -83,7 +83,7 @@ surface it rather than guessing.
   on 2nd launch, ≤~3 daemon calls, config edit → one auto-setup) and a real
   `claude` session launches in the right instance.
 
-- [ ] **T9 — MCP/IDE bridge (`mcp.py`).** Port the preserved fixes (DESIGN §12)
+- [x] **T9 — MCP/IDE bridge (`mcp.py`).** Port the preserved fixes (DESIGN §12)
   targeting the selected instance: `--mcp-config` file staging+mount, loopback
   proxy devices, uid-1000 sentinel, lockfile pid + trailing-slash patches.
   **Done when:** §15.8 (`claude-code-ide` connects end-to-end from an Emacs
@@ -548,3 +548,70 @@ Cleaned up — only `claude-base` (STOPPED) remains, real `~/.local/state`
 untouched. **Not exercised here:** an interactive TUI session (verified via
 `claude --version`, which proves claude launches in the right instance) and the
 `@`-username leg (this host is gianz/1000, same as T4).
+
+### 2026-05-23 — T9: MCP/IDE bridge (`mcp.py`)
+
+**Changed:**
+- `mcp.py`: ported the §12 preserved fixes from the legacy single-file wrapper,
+  re-architected for the **per-cwd instance** model. `Bridge(instance, home=…)`
+  is a **context manager** (was module-global session state + atexit in legacy):
+  `prepare(args)` → rewritten claude args; `cleanup()` (on `__exit__`) tears down.
+  Does: `--mcp-config` **file staging** (copy into a per-session `/tmp/claude-mcp-*`
+  dir bind-mounted at the same path; rewrite args to staged paths; inline JSON &
+  missing files pass through), **loopback proxy devices** (`mcp-proxy-<port>`,
+  `bind=container`) for every port found in config files/inline JSON +
+  `CLAUDE_CODE_SSE_PORT`, the uid-1000 **sentinel**, and the IDE **lockfile patch**
+  (pid → sentinel; `workspaceFolders` trailing slash stripped). Pure helpers
+  `extract_loopback_ports_from_text` + `normalize_workspace_folders` are unit-tested.
+- `incus.py`: extracted `_exec_argv` (shared) and added **`exec_popen`** — a
+  non-blocking `incus exec` returning a `subprocess.Popen`, needed because the
+  sentinel must stay alive while we read its pid from stdout (`exec_` blocks).
+- `lifecycle.py`: wired the bridge into `run` (`with mcp.Bridge(...) as bridge:`
+  around `prepare` + `exec claude`), and **expanded `_exec_env`** to forward the
+  IDE hints (`TERM_PROGRAM`, `FORCE_CODE_TERMINAL`) + cloud/proxy/cert knobs +
+  the `AWS_` prefix. Installed SIGTERM/SIGHUP→SystemExit handlers (restored in
+  `finally`) so the bridge's cleanup fires on those too.
+- `tests/test_mcp.py`: 14 unit tests (port extraction, folder normalisation,
+  daemon-free arg-rewrite branches, lockfile patch).
+
+**Decisions / gotchas for next tasks:**
+- **Sentinel is `sh -c 'echo $$; exec sleep infinity'`** (was `python3 -c` in
+  legacy). `echo $$` prints the container-ns pid; `exec` preserves that pid →
+  no python3 dependency in the base image. Verified: real live pid, owned by
+  uid 1000, killed on stop.
+- **§15.2 budget preserved (re-measured):** with the bridge in the run path, a
+  warm no-MCP launch is still **3 daemon calls** (`query`/`config`/`exec`), 2
+  before claude. `Bridge.prepare`/`cleanup` touch the daemon **zero** times when
+  there's no `--mcp-config` and no `CLAUDE_CODE_SSE_PORT` — **keep this invariant**
+  if T10's reaper adds run-path work.
+- **Proxy `bind=container`** ⇒ the listener lives in the *container* netns, so two
+  instances can both listen on the *same* `127.0.0.1:PORT` with no host
+  collision (verified concurrently). This is the structural basis for §15.9 — and
+  why the legacy "detect-and-refuse" ~/.ssh problem is gone: different scope →
+  different instance → independent devices/sentinels (proven: tearing down A left
+  B's proxy + sentinel intact).
+- **Credential *file* mounts are NOT ported** (legacy hardcoded `aws-dir`,
+  `node-ca-certs`, `gcp-app-creds`, `workspace-specs`). Per DESIGN §7 these are
+  now user `[[mounts]]` in config.toml; T9 only forwards the matching env vars.
+- **Lockfile lives under the globally-mounted `~/.claude`**, so patching the host
+  file is what container claude reads (same inode via the bind mount). The patch
+  uses atomic `os.replace`, leaving Emacs's own bookkeeping (cleanup-by-name) intact.
+- **`split_project_dir`/`--delete-container` from legacy are intentionally gone**
+  (DESIGN §9: always cwd; delete is the `delete` subcommand — T10).
+
+**Verified:** `pytest -q` → **89 passed** (75 prior + 14 mcp). Throwaway
+integration run against the real daemon off `claude-base` (two scratch instances;
+**28/28 checks**): loopback proxy actually forwards container→host (`bash
+/dev/tcp`, host listener received the marker); sentinel is a real live uid-1000
+pid that dies on stop; `--mcp-config` file is staged + bind-mounted + visible
+inside + its port proxied, then fully cleaned up (device + host dir gone);
+no-MCP `prepare` adds zero devices; the SSE path adds both SSE + inline-JSON
+proxies, patches the lockfile pid → sentinel and strips the workspace trailing
+slash; **§15.9** two instances ran concurrently with same-port proxies + live
+sentinels each, and tearing down A left B intact. Cleaned up — only
+`claude-base` (STOPPED) remains. **NOT automatable here (needs the user,
+interactively):** §15.8's actual Emacs + claude-code-ide WebSocket *handshake*
+(MCP tools listed, diagnostics flowing). Every mechanism it depends on is
+verified above; to confirm the live handshake, open an Emacs project buffer
+under a context and check `claude-code-ide` connects. §15.9 likewise verified
+mechanically; a true dual-IDE session would be the final human check.

@@ -15,11 +15,12 @@ import getpass
 import json
 import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import incus, provision
+from . import incus, mcp, provision
 from .config import (
     SCHEMA_VERSION,
     Config,
@@ -509,14 +510,20 @@ def _write_stamp(value: str) -> None:
     p.write_text(value + "\n")
 
 
-# Terminal/locale vars forwarded so the TUI renders correctly; any ANTHROPIC_*/
-# CLAUDE_* host vars are forwarded too (API key, feature flags) — auth itself
-# still comes from the bind-mounted ~/.claude.json.
+# Host env forwarded into the exec. Terminal/locale so the TUI renders right;
+# IDE hints so claude-code-ide recognises its host (§12); cloud/proxy/cert knobs
+# claude honours. The matching credential *files* are exposed via config
+# [[mounts]] (DESIGN §7), not hardcoded here. ANTHROPIC_*/CLAUDE_*/AWS_* are
+# forwarded by prefix (covers the API key, feature flags, CLAUDE_CODE_SSE_PORT).
 _FORWARD_ENV = (
     "TERM", "COLORTERM", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
     "LC_MESSAGES", "LC_TIME", "LC_NUMERIC", "LC_COLLATE", "LC_MONETARY",
+    "TERM_PROGRAM", "FORCE_CODE_TERMINAL",
+    "CLOUD_ML_REGION", "NODE_EXTRA_CA_CERTS", "GOOGLE_APPLICATION_CREDENTIALS",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "API",
 )
-_FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_")
+_FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "AWS_")
 
 
 def _exec_env(host_user: str, home: str) -> dict[str, str]:
@@ -627,14 +634,32 @@ def run(session_mounts: "list[Mount]", passthrough: list[str]) -> int:
         add_project_mount=res.add_project_mount,
     )
     _add_session_mounts(instance, session_mounts)
-    incus.config_set(instance, LAST_USED_KEY, str(int(time.time())))
 
-    return incus.exec_(
-        instance,
-        ["claude", *passthrough],
-        uid=1000,
-        gid=1000,
-        cwd=cwd,
-        env=_exec_env(host_user, home),
-        check=False,
-    )
+    # The MCP/IDE bridge stages config files, adds loopback proxies, and runs the
+    # sentinel + lockfile patch for the duration of the session, tearing it all
+    # down on exit (§12). SIGTERM/SIGHUP are converted to SystemExit so its
+    # context-manager cleanup still fires; normal exit and Ctrl-C already unwind
+    # through it. With no --mcp-config / SSE port the bridge is a no-op.
+    old_handlers = {}
+
+    def _on_term(signum, frame):  # noqa: ANN001
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        old_handlers[sig] = signal.signal(sig, _on_term)
+    try:
+        with mcp.Bridge(instance, home=home) as bridge:
+            argv = bridge.prepare(passthrough)
+            incus.config_set(instance, LAST_USED_KEY, str(int(time.time())))
+            return incus.exec_(
+                instance,
+                ["claude", *argv],
+                uid=1000,
+                gid=1000,
+                cwd=cwd,
+                env=_exec_env(host_user, home),
+                check=False,
+            )
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)

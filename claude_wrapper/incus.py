@@ -180,6 +180,29 @@ def copy(src: str, dst: str, *, extra_args: list[str] | None = None) -> int:
     return cli_run("copy", src, dst, *(extra_args or []))
 
 
+def _exec_argv(
+    name: str,
+    command: list[str],
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Build the ``exec ...`` arg vector shared by :func:`exec_`/:func:`exec_popen`."""
+    args = ["exec", name]
+    if uid is not None:
+        args += ["--user", str(uid)]
+    if gid is not None:
+        args += ["--group", str(gid)]
+    if cwd is not None:
+        args += ["--cwd", cwd]
+    for key, val in (env or {}).items():
+        args += ["--env", f"{key}={val}"]
+    args += ["--", *command]
+    return args
+
+
 def exec_(
     name: str,
     command: list[str],
@@ -200,19 +223,35 @@ def exec_(
     user pass both. With *capture* the stdout string is returned; otherwise
     output is streamed and the return code is returned.
     """
-    args = ["exec", name]
-    if uid is not None:
-        args += ["--user", str(uid)]
-    if gid is not None:
-        args += ["--group", str(gid)]
-    if cwd is not None:
-        args += ["--cwd", cwd]
-    for key, val in (env or {}).items():
-        args += ["--env", f"{key}={val}"]
-    args += ["--", *command]
+    args = _exec_argv(name, command, uid=uid, gid=gid, cwd=cwd, env=env)
     if capture:
         return cli_quiet(*args, check=check, stdin_text=stdin_text)
     return cli_run(*args, check=check, stdin_text=stdin_text)
+
+
+def exec_popen(
+    name: str,
+    command: list[str],
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+    env: dict[str, str] | None = None,
+    **popen_kwargs: object,
+) -> subprocess.Popen:
+    """Spawn ``incus exec`` as a **background** process; the caller owns its life.
+
+    Used for the long-lived MCP uid-1000 sentinel (T9), which must keep running
+    while we read its container-namespace pid from stdout. Unlike :func:`exec_`
+    this does not block. Raises :class:`IncusError` if the binary is missing.
+    """
+    argv = [INCUS, *_exec_argv(name, command, uid=uid, gid=gid, env=env)]
+    try:
+        return subprocess.Popen(argv, **popen_kwargs)  # type: ignore[arg-type]
+    except FileNotFoundError as e:
+        raise IncusError(
+            f"`{INCUS}` not found on PATH — is incus installed? "
+            "(Ubuntu: `apt install incus`)"
+        ) from e
 
 
 # --- device management (cached show) -----------------------------------------
