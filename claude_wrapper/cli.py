@@ -71,8 +71,13 @@ def parse_run_args(args: list[str]) -> tuple[list[Mount], list[str]]:
 
 
 def cmd_setup(args: list[str]) -> int:
-    print("claude-wrapper setup: not implemented")
-    return 0
+    from . import config, incus, lifecycle
+
+    try:
+        return lifecycle.setup()
+    except (config.ConfigError, lifecycle.SetupError, incus.IncusError) as e:
+        print(f"claude-wrapper setup: {e}", file=sys.stderr)
+        return 1
 
 
 def cmd_delete(args: list[str]) -> int:

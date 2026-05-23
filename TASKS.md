@@ -47,7 +47,7 @@ surface it rather than guessing.
   **Done when:** a throwaway script can launch+delete a container and add/remove
   a disk device through these helpers.
 
-- [ ] **T4 — Base build (`lifecycle.py`: `build_base`).** `setup` builds
+- [x] **T4 — Base build (`lifecycle.py`: `build_base`).** `setup` builds
   `claude-base` per DESIGN §3/§11/§12: launch `images:ubuntu/24.04`, rename user
   to `$USER` via `/etc/passwd`/`/etc/group` edit, home = `$HOME` (`usermod -d -m`),
   `raw.idmap` host→1000, subuid detection + **print** sudo line, `raw.apparmor`
@@ -226,3 +226,69 @@ gone): **20/20 checks passed, 0 leftover containers**. `pytest -q` → 20 passed
 (no regression). Note: `images:alpine/3.20` doesn't exist on the remote; the
 current alias is `alpine/3.21` (irrelevant to T4, which uses `images:ubuntu/24.04`
 = the `ubuntu/noble` container variant, confirmed present in the remote).
+
+### 2026-05-23 — T4: Base build (`lifecycle.py`: `build_base`)
+
+**Changed:** Implemented the tier-1 base build end-to-end.
+- `lifecycle.py`: `build_base(cfg, *, host_user, host_uid, host_gid, home)` +
+  `setup(cfg=None)` (the `setup` entry point — gathers identity from
+  `os.environ["USER"]`/`getuid`/`getgid`/`$HOME`, loads user config, builds
+  base; **templates are T5**, stamp/gc are T8/T10). Sequence: subuid check →
+  delete-and-recreate → `launch images:ubuntu/24.04` → `set raw.idmap`
+  (`uid/gid <host> 1000`) + `raw.apparmor` (`ptrace,\nsignal,\n`) →
+  `restart --force` → wait-agent (sentinel `echo ok`) → wait-DNS
+  (`getent hosts claude.ai`) → identity → claude install → packages →
+  global provision script → global mounts → **stop** (frozen CoW source).
+- `provision.py`: `install_packages` (dpkg-probe → apt only if missing) +
+  `run_provision_script` (root, prepends `set -euo pipefail`; absent file →
+  warn+skip, runtime error → fails setup loudly).
+- `cli.py`: `cmd_setup` now calls `lifecycle.setup()`, catching
+  `ConfigError`/`SetupError`/`IncusError` → stderr + rc 1.
+- `incus.py`: **added `gid` param to `exec_`** (`--group`). Justified
+  mechanism completion — incus defaults gid to 0 when only `--user` is given,
+  and every uid-1000 exec (install now, `exec claude` in T8) needs gid 1000.
+
+**Decisions / gotchas for next tasks:**
+- **Identity rename is a direct field-exact edit** (`_IDENTITY_SCRIPT`, run as
+  root): `usermod -d "$HOME" -m ubuntu` does the **home move while the login is
+  still the valid `ubuntu`** (usermod -l rejects `@`), then awk rewrites field-1
+  of passwd/shadow and field-1 + member-list (`$NF`) of group/gshadow,
+  `ubuntu`→`$USER`. `cat >file` (not `mv`) preserves shadow perms. Verified on
+  this host: `ubuntu`→`gianz`, group renamed too (`id` → `1000(gianz)`).
+  **The `@`/UID≠1000 path is implemented but untested here** (host is
+  gianz/1000); the mechanism mirrors the legacy approach that worked on the
+  work laptop. T5+ inherit this via CoW so no re-test needed per instance.
+- **sudoers is keyed by `#1000`** (`/etc/sudoers.d/claude-wrapper`), not the
+  name — `@` is netgroup syntax in sudoers. T8 can rely on passwordless sudo.
+- **`raw.idmap`/`raw.apparmor` + all devices propagate via `incus copy`** —
+  confirmed: a CoW copy of the stopped base inherited both raw.* keys and the
+  `mnt-*` devices and came up STOPPED. So T5 templates / T8 instances get
+  identity + apparmor + global mounts for free from the copy.
+- **Mount device naming:** `_mount_device_name(spec)` = `mnt-<md5(path)[:8]>`
+  (deterministic, keyed on the *container* path). T5 reuses `_add_mount_devices`
+  for context mounts; **`spec.exclude` masking is deferred to T7** (the helper
+  skips it for now). Absent host sources are silently skipped (§7).
+- **claude install runs as uid 1000/gid 1000** with `HOME`/`USER` env + cwd=home
+  (no `su`), native method → `$HOME/.local/bin/claude`. `installMethod` read
+  from host `~/.claude.json` (here: `native`, claude 2.1.150). Note the
+  installer warns `~/.local/bin not in PATH` — **T8 must prepend
+  `$HOME/.local/bin` to PATH** at exec time (the §12 PATH item; not baked into
+  base).
+- **Base is left STOPPED**; only `setup` ever builds/touches it. `setup` is
+  unconditional delete-and-recreate (base holds no unique state).
+- Verified `setup` is **idempotent re: packages** — `install_packages` probes
+  with `dpkg-query` and only runs apt on a miss (a re-`setup` rebuilds base from
+  scratch though, so it reinstalls; the probe matters for the §15.2 hot path).
+
+**Verified:** `python3 -m pytest -q` → 20 passed (no regression).
+`python3 -m claude_wrapper.cli setup` → exit 0, builds `claude-base` (claude
+native 2.1.150, jq, both global mounts `~/.claude`+`~/.claude.json`), base left
+STOPPED with correct `raw.idmap`/`raw.apparmor`. **§15.1** verified via a CoW
+throwaway instance (the design-faithful way to inspect a never-run base):
+`whoami`==`gianz`, `$HOME`==`/home/gianz` (passwd + `$HOME` + `cd ~` agree),
+`id`==`uid=1000(gianz) gid=1000(gianz)`, claude binary present, **bind-mount
+ownership parity both directions** (host-made & container-made files both
+`gianz:gianz` on both sides), jq present, uid-keyed sudoers. Throwaway instance
++ parity temp dir cleaned up; only `claude-base` (STOPPED) remains.
+**Not testable on this host:** the `@`-username / UID≠1000 leg of §15.1 and the
+missing-subuid printed-sudo-line path (this host has `root:1000:1`).

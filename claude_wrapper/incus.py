@@ -163,6 +163,7 @@ def exec_(
     command: list[str],
     *,
     uid: int | None = None,
+    gid: int | None = None,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     capture: bool = False,
@@ -171,13 +172,17 @@ def exec_(
 ) -> int | str:
     """Run *command* inside instance *name* (``incus exec``).
 
-    ``uid`` maps to ``--user`` (the numeric UID keys the exec path, never the
-    possibly-``@`` username — DESIGN §3). With *capture* the stdout string is
-    returned; otherwise output is streamed and the return code is returned.
+    ``uid``/``gid`` map to ``--user``/``--group`` (the numeric IDs key the exec
+    path, never the possibly-``@`` username — DESIGN §3). incus defaults the
+    gid to 0 when only ``--user`` is given, so callers running as the sandbox
+    user pass both. With *capture* the stdout string is returned; otherwise
+    output is streamed and the return code is returned.
     """
     args = ["exec", name]
     if uid is not None:
         args += ["--user", str(uid)]
+    if gid is not None:
+        args += ["--group", str(gid)]
     if cwd is not None:
         args += ["--cwd", cwd]
     for key, val in (env or {}).items():
