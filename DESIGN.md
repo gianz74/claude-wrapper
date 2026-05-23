@@ -52,9 +52,14 @@ idle instance is a ~tens-of-MB userspace process tree, not a VM.
 | 2 | `claude-sandbox-<ctx>` | `setup` (CoW of base + context mounts + per-context provision) | **never** | **no — pure CoW source** |
 | 3 | `claude-sandbox-<ctx>-<hash8(scope)>` | on demand (CoW of tier 2) | yes | yes — work happens here; reaped by `gc` |
 
-- Templates (tier 2) are **never started** — that is how they stay immutable;
-  CoW-copying from them gives each instance the context's mount devices in a
-  single `incus copy` (no per-instance device-add calls).
+- Templates (tier 2) are **never started by the run path** — that is how they
+  stay immutable; CoW-copying from them gives each instance the context's mount
+  devices in a single `incus copy` (no per-instance device-add calls). The sole
+  exception is `setup` itself: a template that has a per-context
+  `provision_script` is **transiently started during `setup`** (the only way to
+  `incus exec` the script), then stopped. A template with no provision script is
+  never started at all. Either way the template's resting state is STOPPED and
+  nothing outside `setup` ever starts it.
 - Devices propagate down the CoW chain: global `[[mounts]]` live on `claude-base`
   → inherited by all; `[[contexts.mounts]]` live on the context template →
   inherited by that context's instances; the project/scope mount lives on the
@@ -214,8 +219,9 @@ provision_script = "~/.config/claude-wrapper/provision-api.sh"   # optional; run
 - External (your policy, in config dir): `[setup].packages` (wrapper runs
   `apt-get install -y …`) + optional `[setup].provision_script` (run on
   `claude-base`, as root, `set -e`, output streamed, setup fails loudly on
-  error) + optional per-context `provision_script` (run on that template).
-  Re-run on every `setup` (which rebuilds base/templates).
+  error) + optional per-context `provision_script` (run on that template — the
+  template is transiently started for this during `setup` only, then stopped;
+  see §4). Re-run on every `setup` (which rebuilds base/templates).
 
 ## 12. Preserved fixes (ported, parameterized by the selected instance)
 

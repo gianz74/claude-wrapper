@@ -56,7 +56,7 @@ surface it rather than guessing.
   acceptance §15.1 passes (whoami==$USER, $HOME correct, bind-mount ownership
   parity; missing subuid → printed sudo line + exit).
 
-- [ ] **T5 — Context templates (`lifecycle.py`: `build_templates`).** CoW
+- [x] **T5 — Context templates (`lifecycle.py`: `build_templates`).** CoW
   `claude-base` → `claude-sandbox-<ctx>` per context, add context mounts +
   per-context `provision_script`; prune templates for removed contexts; skip +
   warn on running containers; never start a template. **Done when:** templates
@@ -292,3 +292,75 @@ ownership parity both directions** (host-made & container-made files both
 + parity temp dir cleaned up; only `claude-base` (STOPPED) remains.
 **Not testable on this host:** the `@`-username / UID≠1000 leg of §15.1 and the
 missing-subuid printed-sudo-line path (this host has `root:1000:1`).
+
+### 2026-05-23 — T5: Context templates (`lifecycle.build_templates`)
+
+**Design clarification (user-approved, folded into DESIGN §4 + §11):** a
+per-context `provision_script` must run *inside* its template, but `incus exec`
+needs a **running** container — which collides with "templates are never
+started." Resolution chosen: **transient start during `setup` only**. A template
+*with* a provision script is briefly started to run it, then stopped; a template
+*without* one is never started at all. Either way the resting state is STOPPED
+and the run path never starts a template (mirrors how `build_base` works). The
+two other readings (build-container indirection; defer provision to instance
+time) were rejected. DESIGN §4/§11 now state this exception explicitly.
+
+**Changed:**
+- `incus.py`: added `list_instances()` — all instances as REST objects in **one**
+  `query /1.0/instances?recursion=1` call (name + `config` tags + `status`).
+  Used by prune now; T10 reaper will reuse it.
+- `lifecycle.py`: `build_templates(cfg)` (validate names → prune removed → build
+  each), `_build_template` (delete+recopy from base, tag, add context mounts,
+  optional provision), `_prune_templates`, `_provision_template` (transient
+  start/stop, `finally: stop`), `_template_name`, `_check_template_name`, and
+  constants `TEMPLATE_PREFIX`/`ROLE_KEY`/`CONTEXT_KEY`/`_NAME_RE`. Wired into
+  `setup()` after `build_base`.
+- `tests/test_lifecycle_names.py`: 11 unit tests for the pure name logic.
+
+**Decisions / gotchas for next tasks:**
+- **Tier tagging via incus `user.*` config, not name-parsing.** Templates carry
+  `user.cw-role=template` + `user.cw-context=<ctx>`. **T8 must tag tier-3
+  instances `user.cw-role=instance`** (+ `user.cw-context`) so prune/gc can tell
+  the three tiers apart — context names may contain dashes, so the
+  `claude-sandbox-<ctx>` vs `claude-sandbox-<ctx>-<hash8>` split is **not** safely
+  name-parseable. Constants live in `lifecycle.py` (`ROLE_KEY`, `CONTEXT_KEY`).
+  Follows the design's existing `user.last-used` convention (hyphens in
+  `user.*` keys are valid — confirmed).
+- **Prune keys off the `template` role tag** (one `list_instances()` call), so it
+  never touches base (untagged) or future instances (role=instance). A template
+  whose `cw-context` is absent from the loaded config is deleted; a **running**
+  one is skipped with a warning (verified). Configured templates are skipped by
+  prune and rebuilt by the build loop.
+- **`build_templates(cfg)` takes only cfg** — no identity args. Identity / idmap
+  / apparmor / **global mounts** all propagate from base through `incus copy`
+  (re-confirmed: copied template carried base's `mnt-*` global-mount devices +
+  raw.idmap/apparmor and came up STOPPED). `cfg.mounts` is **not** re-applied
+  here — only `build_base` consumes it; templates only add `ctx.mounts`.
+- **`_add_mount_devices` reused as-is** for context mounts (incl. `mode=ro` →
+  `readonly=true`, verified). `spec.exclude` masking is still **deferred to T7**
+  (the helper skips it). **Known edge (documented, not handled):** a context
+  mount whose container `path` equals a global mount's path collides on the
+  deterministic `mnt-<md5(path)[:8]>` device name (the global one is inherited),
+  so `device_add` would error. Unusual config; revisit if it bites.
+- **Name validation** (`_check_template_name`): `claude-sandbox-<ctx>` must match
+  incus's instance-name rules (ASCII letters/digits/dashes, 2-63 chars, no
+  trailing dash). Underscores/spaces/non-ASCII/over-long → `SetupError` *before*
+  any destructive op. This is the first task that turns a context name into a
+  container name, so the check lives here.
+- **`setup()` now does base + templates**; final line notes stamp/reaper are
+  T8/T10. The `user.cw-role` tagging means T10's gc can enumerate by tier.
+- **Provision failure** in a template: `run_provision_script` raises (check=True)
+  → setup aborts loudly; `finally: stop` still returns the half-built template to
+  STOPPED (next `setup` delete+recopies it since it's still configured).
+
+**Verified:** `pytest -q` → **31 passed** (20 config + 11 new name tests).
+Throwaway integration run against the real incus daemon (two synthetic contexts —
+`t5a` plain, `t5b` with a provision script + an `ro` mount; **14/14 checks**):
+both templates exist + **STOPPED**; tags set; `t5a` carries its context mount +
+the 2 inherited base global mounts; `t5b`'s context mount is `readonly=true`;
+the `t5b` provision script ran (marker verified via a CoW throwaway, since the
+template is never run in prod); removing `t5b` from config + re-`build_templates`
+**pruned `t5b` and kept `t5a`**. Separate run verified the **skip-running**
+branches of both `_prune_templates` and `_build_template` (warn + leave intact).
+All test containers + temp dirs cleaned up; `incus list` shows only
+`claude-base` STOPPED.

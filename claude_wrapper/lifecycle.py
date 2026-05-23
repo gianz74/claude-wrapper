@@ -14,16 +14,28 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from . import incus, provision
-from .config import Config, MountSpec, load_user_config
+from .config import Config, Context, MountSpec, load_user_config
 
 # Tier 1: the frozen base. Tier-2 templates CoW-copy from it (T5); it is built
 # (started, provisioned) by setup, then stopped and never run again.
 BASE = "claude-base"
 IMAGE = "images:ubuntu/24.04"
+
+# Tier-2 template naming: claude-sandbox-<ctx>. Tier-3 instances (T8) extend
+# this with -<hash8(scope)>, so we tag tier explicitly via incus `user.*` config
+# rather than parsing names (a context name may itself contain dashes).
+TEMPLATE_PREFIX = "claude-sandbox-"
+ROLE_KEY = "user.cw-role"  # "template" (this tier) | "instance" (T8) | unset
+CONTEXT_KEY = "user.cw-context"  # the owning context's name
+
+# incus instance names: 2-63 chars, letters/digits/dashes, must not end in a
+# dash (ours always start with "claude-", so the leading-char rule is moot).
+_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]$")
 
 # ptrace + signal across the stacked apparmor sub-profiles. Bun/JSC sends
 # SIGPWR to suspend sibling threads for stop-the-world GC; the default profile
@@ -289,14 +301,114 @@ def build_base(
     print(f"{BASE} ready.")
 
 
+# --- tier 2: context templates (DESIGN §4/§11) -------------------------------
+
+
+def _template_name(ctx_name: str) -> str:
+    return f"{TEMPLATE_PREFIX}{ctx_name}"
+
+
+def _check_template_name(ctx_name: str) -> None:
+    """Reject a context name that yields an illegal incus instance name."""
+    name = _template_name(ctx_name)
+    if not _NAME_RE.match(name):
+        raise SetupError(
+            f"context {ctx_name!r} yields invalid instance name {name!r}: "
+            "context names may contain only ASCII letters, digits and dashes "
+            "(no underscores/spaces), and the full name must be 2-63 chars and "
+            "not end with a dash."
+        )
+
+
+def _provision_template(name: str, ctx: Context) -> None:
+    """Transiently start *name* (setup only) to run its per-context script (§4).
+
+    A template is otherwise never started; this is the sole exception and the
+    only way to ``incus exec`` the script. ``finally: stop`` guarantees the
+    template returns to STOPPED even if the script fails (which still aborts
+    setup loudly — ``run_provision_script`` raises on a non-zero exit).
+    """
+    print(f"Starting {name} transiently to run its provision script...")
+    incus.start(name)
+    try:
+        _wait_for_agent(name)
+        _wait_for_dns(name)
+        provision.run_provision_script(
+            name, ctx.provision_script, label=f"context {ctx.name!r}"
+        )
+    finally:
+        incus.stop(name)
+
+
+def _build_template(ctx: Context) -> None:
+    """Build one tier-2 template by CoW of base + context mounts + provision.
+
+    Delete-and-recopy (templates hold no unique state). A template that is
+    somehow running is skipped with a warning rather than clobbered (§4).
+    """
+    name = _template_name(ctx.name)
+    if incus.is_running(name):
+        print(f"warning: template {name} is running; skipping rebuild "
+              "(stop it, then re-run `claude-wrapper setup`).")
+        return
+    if incus.container_exists(name):
+        print(f"Rebuilding template {name} (delete + recopy)...")
+        incus.delete(name)
+
+    print(f"Building template {name} (CoW of {BASE})...")
+    incus.copy(BASE, name)  # inherits idmap/apparmor/global mounts; stays STOPPED
+    incus.config_set(name, ROLE_KEY, "template")
+    incus.config_set(name, CONTEXT_KEY, ctx.name)
+    _add_mount_devices(name, ctx.mounts)  # exclude-masking is T7
+    if ctx.provision_script:
+        _provision_template(name, ctx)
+    print(f"Template {name} ready (STOPPED).")
+
+
+def _prune_templates(configured: set[str]) -> None:
+    """Delete tier-2 templates whose context was removed from config (§4).
+
+    Identifies templates by the ``user.cw-role`` tag (not by name) in a single
+    listing call; a running template is skipped with a warning.
+    """
+    for inst in incus.list_instances():
+        conf = inst.get("config") or {}
+        if conf.get(ROLE_KEY) != "template":
+            continue
+        ctx_name = conf.get(CONTEXT_KEY)
+        if ctx_name in configured:
+            continue  # still configured — rebuilt by the build loop
+        name = inst.get("name", "")
+        if inst.get("status") == "Running":
+            print(f"warning: template {name} (removed context {ctx_name!r}) is "
+                  "running; skipping prune.")
+            continue
+        print(f"Pruning template {name} (context {ctx_name!r} removed from config)...")
+        incus.delete(name)
+
+
+def build_templates(cfg: Config) -> None:
+    """Build/refresh every configured context's tier-2 template; prune the rest.
+
+    Requires ``claude-base`` to exist (built first by :func:`build_base`).
+    Templates inherit identity/idmap/apparmor/global mounts from base via the
+    CoW copy, so no identity arguments are needed here.
+    """
+    for ctx in cfg.contexts:
+        _check_template_name(ctx.name)
+    _prune_templates({c.name for c in cfg.contexts})
+    for ctx in cfg.contexts:
+        _build_template(ctx)
+
+
 # --- setup entry point (DESIGN §9) -------------------------------------------
 
 
 def setup(cfg: Config | None = None) -> int:
     """The ``setup`` subcommand: unconditional, idempotent full provision.
 
-    T4 builds the base. T5 adds ``build_templates`` + context pruning; T8/T10
-    add the stamp write + reaper pass.
+    T4 builds the base; T5 builds the context templates + prunes removed ones.
+    T8/T10 add the stamp write + reaper pass.
     """
     if cfg is None:
         cfg = load_user_config()
@@ -305,5 +417,8 @@ def setup(cfg: Config | None = None) -> int:
     host_gid = os.getgid()
     home = os.environ.get("HOME") or os.path.expanduser("~")
     build_base(cfg, host_user=host_user, host_uid=host_uid, host_gid=host_gid, home=home)
-    print("setup: base complete. (context templates land in T5.)")
+    build_templates(cfg)
+    n = len(cfg.contexts)
+    print(f"setup: base + {n} context template(s) complete. "
+          "(stamp/reaper land in T8/T10.)")
     return 0

@@ -111,6 +111,28 @@ def instance_info(name: str) -> dict | None:
     return obj if isinstance(obj, dict) and obj.get("name") == name else None
 
 
+def list_instances() -> list[dict]:
+    """Return every instance as a REST object (one daemon call, ``recursion=1``).
+
+    Used by template pruning (T5) and the reaper (T10) to enumerate containers
+    and read their ``user.*`` tags + ``status`` without a query per instance.
+    Returns ``[]`` if the listing fails.
+    """
+    proc = _run(
+        ["query", "/1.0/instances?recursion=1"],
+        capture=True,
+        check=False,
+        stdin_text=None,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [i for i in data if isinstance(i, dict)] if isinstance(data, list) else []
+
+
 def container_exists(name: str) -> bool:
     return instance_info(name) is not None
 
