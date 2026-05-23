@@ -1,0 +1,118 @@
+"""CLI dispatch / argument parsing (DESIGN §9).
+
+Two paths:
+
+* **Subcommands** (``setup``, ``delete [<name>]``, ``gc``) — terminal; they do
+  their thing and exit, never invoking ``claude``.
+* **Run path** (anything else) — a *leading-block* parse: leading
+  ``--mount PATH[:ro]`` modifiers are consumed by the wrapper; the first
+  non-wrapper token ends the block and everything from there is passed to
+  ``claude`` verbatim. An explicit ``--`` force-terminates wrapper parsing.
+
+T1 wires up dispatch + parsing only. Subcommands and the run path forward to
+stubs; the real implementations land in later tasks (lifecycle/mounts/...).
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import NamedTuple
+
+SUBCOMMANDS = ("setup", "delete", "gc")
+
+
+class Mount(NamedTuple):
+    """An ad-hoc per-session mount requested via ``--mount``."""
+
+    path: str
+    mode: str  # "ro" | "rw"
+
+
+def _parse_mount_spec(spec: str) -> Mount:
+    """Parse a ``--mount`` argument: ``PATH``, ``PATH:ro`` or ``PATH:rw``."""
+    if spec.endswith(":ro"):
+        return Mount(spec[:-3], "ro")
+    if spec.endswith(":rw"):
+        return Mount(spec[:-3], "rw")
+    return Mount(spec, "rw")
+
+
+def parse_run_args(args: list[str]) -> tuple[list[Mount], list[str]]:
+    """Leading-block parse for the run path.
+
+    Returns ``(mounts, passthrough)`` where *mounts* are wrapper-consumed
+    ``--mount`` modifiers and *passthrough* is forwarded to ``claude``
+    verbatim. The first non-wrapper token (or an explicit ``--``) ends the
+    leading block.
+    """
+    mounts: list[Mount] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            # Force-terminate wrapper parsing; the rest is passthrough.
+            return mounts, args[i + 1 :]
+        if tok == "--mount":
+            if i + 1 >= len(args):
+                sys.exit("claude-wrapper: --mount requires a PATH argument")
+            mounts.append(_parse_mount_spec(args[i + 1]))
+            i += 2
+            continue
+        if tok.startswith("--mount="):
+            mounts.append(_parse_mount_spec(tok[len("--mount=") :]))
+            i += 1
+            continue
+        # First non-wrapper token ends the block.
+        return mounts, args[i:]
+    return mounts, []
+
+
+# --- subcommand stubs (real impls land in later tasks) ----------------------
+
+
+def cmd_setup(args: list[str]) -> int:
+    print("claude-wrapper setup: not implemented")
+    return 0
+
+
+def cmd_delete(args: list[str]) -> int:
+    target = args[0] if args else "(all)"
+    print(f"claude-wrapper delete {target}: not implemented")
+    return 0
+
+
+def cmd_gc(args: list[str]) -> int:
+    print("claude-wrapper gc: not implemented")
+    return 0
+
+
+def run_passthrough(mounts: list[Mount], passthrough: list[str]) -> int:
+    """Run-path stub: resolve context/scope/instance and ``exec claude``.
+
+    T1 just reports the parse so the leading-block behaviour is observable;
+    the real run path is implemented in T8.
+    """
+    print("claude-wrapper run: not implemented")
+    print(f"  mounts:      {[tuple(m) for m in mounts]}")
+    print(f"  passthrough: {passthrough}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+
+    if args and args[0] in SUBCOMMANDS:
+        name, rest = args[0], args[1:]
+        return {
+            "setup": cmd_setup,
+            "delete": cmd_delete,
+            "gc": cmd_gc,
+        }[name](rest)
+
+    # Run path: everything that is not a known subcommand.
+    mounts, passthrough = parse_run_args(args)
+    return run_passthrough(mounts, passthrough)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
