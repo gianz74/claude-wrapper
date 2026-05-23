@@ -92,15 +92,23 @@ def cmd_gc(args: list[str]) -> int:
 
 
 def run_passthrough(mounts: list[Mount], passthrough: list[str]) -> int:
-    """Run-path stub: resolve context/scope/instance and ``exec claude``.
+    """Run path (DESIGN §9/§10): resolve context/scope/instance and ``exec claude``.
 
-    T1 just reports the parse so the leading-block behaviour is observable;
-    the real run path is implemented in T8.
+    Ad-hoc ``--mount`` modifiers and the passthrough args are handed to
+    :func:`lifecycle.run`, which auto-``setup``s on stamp drift, ensures the
+    per-cwd instance exists + runs, then execs claude. Returns claude's exit code.
     """
-    print("claude-wrapper run: not implemented")
-    print(f"  mounts:      {[tuple(m) for m in mounts]}")
-    print(f"  passthrough: {passthrough}")
-    return 0
+    from . import config, incus, lifecycle
+    from .mounts import RefuseError
+
+    try:
+        return lifecycle.run(mounts, passthrough)
+    except RefuseError as e:
+        print(f"claude-wrapper: {e}", file=sys.stderr)
+        return 1
+    except (config.ConfigError, lifecycle.SetupError, incus.IncusError) as e:
+        print(f"claude-wrapper: {e}", file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -75,7 +75,7 @@ surface it rather than guessing.
   **Done when:** §15.5 (excluded path empty inside) and §15.6 (whitelisted
   sibling absent) pass.
 
-- [ ] **T8 — Run path + instance lifecycle (`lifecycle.py`: `run`).** Stamp
+- [x] **T8 — Run path + instance lifecycle (`lifecycle.py`: `run`).** Stamp
   check (`hash(version+config)`) → auto-`setup` on drift; resolve→scope→instance
   name; ensure instance exists (CoW from template) + running (`start`); bump
   `user.last-used`; add project mount if not subsumed; `exec claude` with env
@@ -485,3 +485,66 @@ start → assert as uid/gid 1000 → delete): **10/10 checks** — mask device c
 **real secret unreadable** (mask on top); masked path is a (read-only) dir;
 whitelisted A & B present + readable; **non-whitelisted sibling C absent**. Only
 `claude-base` (STOPPED) remains; temp dirs cleaned up.
+
+### 2026-05-23 — T8: Run path + instance lifecycle (`lifecycle.run`)
+
+**Changed:**
+- `lifecycle.py`: added the run path + stamp. `run(session_mounts, passthrough)`
+  = stamp drift check → `resolve` → instance name → `_ensure_instance` →
+  ad-hoc `--mount` → bump `user.last-used` → `exec claude` (returns claude's rc,
+  instance left running). Stamp helpers: `_state_dir` (`$XDG_STATE_HOME` →
+  `~/.local/state/claude-wrapper`), `_stamp_path`, `_config_stamp` (=
+  `md5(SCHEMA_VERSION + config.toml bytes)`), `_read_stamp`/`_write_stamp`.
+  `_ensure_instance` (cold: CoW from template/base, tag role+context, project
+  mount unless subsumed, start, wait agent+DNS; warm: start if stopped).
+  `_exec_env` (HOME/USER + `~/.local/bin` PATH prepend + forwarded
+  TERM/locale/`ANTHROPIC_*`/`CLAUDE_*`). `_add_session_mounts` (ad-hoc `--mount`
+  → idempotent disk devices). Added `LAST_USED_KEY = "user.last-used"`.
+- **`setup()` now writes the stamp** (and uses `ensure_user_config` +
+  `load_config` so it has the path to fingerprint). So both manual `setup` and
+  the auto-setup path leave a matching stamp → next run is the fast path.
+- `cli.py`: `run_passthrough` now calls `lifecycle.run`, catching
+  `RefuseError`/`ConfigError`/`SetupError`/`IncusError` → stderr + rc 1.
+- `tests/test_lifecycle_stamp.py`: 5 unit tests for the pure stamp logic.
+
+**Decisions / gotchas for next tasks:**
+- **Instance name** = `f"{_template_name(ctx_name)}-{scope_hash(scope)}"`; the
+  CoW **source** is `claude-base` for the `default` context (no template) and
+  `claude-sandbox-<ctx>` otherwise (the T6 note, now implemented). Tier-3
+  instances are tagged `user.cw-role=instance` + `user.cw-context=<ctx>` — **T10
+  gc/reaper enumerates by these tags** (base untagged, templates `=template`).
+- **Daemon-call budget (§15.2) — MEASURED.** Warm 2nd launch = exactly **3**
+  daemon calls: `query` (`instance_info`) + `config` (`config_set` last-used) +
+  `exec` (= claude starting). Only **2 before claude starts**. The hot path adds
+  **no** project-mount/device check (project mount is persistent, added once at
+  creation) and `_add_session_mounts([])` returns before any `device_show`, so
+  an empty `--mount` costs zero calls. **Keep this lever in mind for T9/T10** —
+  any per-run MCP/reaper work must not blow the ≤3 budget on the no-op case.
+- **PATH resolves bare `claude`.** `exec_` with `--env PATH=$HOME/.local/bin:…`
+  lets incus find the native-install `claude` by name (verified: rc 0, version
+  printed). T9's MCP bridge can rely on the same env path.
+- **Stamp lives at `~/.local/state/claude-wrapper/stamp`** (XDG_STATE_HOME).
+  **T10's `last-reap` stamp belongs in the same `_state_dir()`** — reuse it.
+- **Auto-setup is "exactly once":** `setup()` writes the stamp at the end, so a
+  drift run setups + stamps, and the next run matches → no second setup
+  (verified with a counter). A schema bump *or* any config edit flips the stamp.
+- **Ad-hoc `--mount` is wired but persists** (added as idempotent disk devices
+  on the scope-shared instance, so it lingers for later same-scope sessions).
+  Accepted/flagged — not an acceptance criterion (§15 never exercises `--mount`).
+  If true per-session semantics are ever wanted, that needs per-session
+  teardown (not built). Surface to the user if it bites.
+- **T8 does NOT reap.** Instances are left running; the amortized background
+  reap that §10 lists as the run path's tail is **T10** (with `gc`/`delete`).
+
+**Verified:** `pytest -q` → **75 passed** (70 prior + 5 stamp). Throwaway
+integration run against the real daemon (stamp pre-seeded to reuse the existing
+`claude-base`, temp `XDG_STATE_HOME` so real state is untouched; **17/17
+checks**): cold run created `claude-sandbox-default-<hash>`, ran `claude
+--version` (rc 0, 2.1.150) as uid 1000, `whoami`==`gianz`, `$HOME` correct,
+project mount = parity scope, role/last-used tags set, cwd visible inside; warm
+run = 3 daemon calls (`query`/`config`/`exec`), no apt/dpkg, no copy/launch;
+stamp drift → exactly one auto-setup + rewrite, no re-setup on the next run.
+Cleaned up — only `claude-base` (STOPPED) remains, real `~/.local/state`
+untouched. **Not exercised here:** an interactive TUI session (verified via
+`claude --version`, which proves claude launches in the right instance) and the
+`@`-username leg (this host is gianz/1000, same as T4).

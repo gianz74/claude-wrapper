@@ -17,10 +17,21 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import incus, provision
-from .config import Config, Context, MountSpec, load_user_config
-from .mounts import ensure_mask_dir, mask_container_paths
+from .config import (
+    SCHEMA_VERSION,
+    Config,
+    Context,
+    MountSpec,
+    ensure_user_config,
+    load_config,
+)
+from .mounts import ensure_mask_dir, mask_container_paths, resolve, scope_hash
+
+if TYPE_CHECKING:  # avoid a run-time cli<->lifecycle import cycle
+    from .cli import Mount
 
 # Tier 1: the frozen base. Tier-2 templates CoW-copy from it (T5); it is built
 # (started, provisioned) by setup, then stopped and never run again.
@@ -31,8 +42,9 @@ IMAGE = "images:ubuntu/24.04"
 # this with -<hash8(scope)>, so we tag tier explicitly via incus `user.*` config
 # rather than parsing names (a context name may itself contain dashes).
 TEMPLATE_PREFIX = "claude-sandbox-"
-ROLE_KEY = "user.cw-role"  # "template" (this tier) | "instance" (T8) | unset
+ROLE_KEY = "user.cw-role"  # "template" (this tier) | "instance" (tier 3) | unset
 CONTEXT_KEY = "user.cw-context"  # the owning context's name
+LAST_USED_KEY = "user.last-used"  # epoch seconds; bumped each run, read by the reaper (T10)
 
 # incus instance names: 2-63 chars, letters/digits/dashes, must not end in a
 # dash (ours always start with "claude-", so the leading-char rule is moot).
@@ -431,18 +443,198 @@ def build_templates(cfg: Config) -> None:
 def setup(cfg: Config | None = None) -> int:
     """The ``setup`` subcommand: unconditional, idempotent full provision.
 
-    T4 builds the base; T5 builds the context templates + prunes removed ones.
-    T8/T10 add the stamp write + reaper pass.
+    Builds the base (T4), the context templates + prunes removed ones (T5), and
+    writes the config stamp (T8) so the next normal run takes the fast path. The
+    reaper pass is T10.
     """
+    config_path = ensure_user_config()
     if cfg is None:
-        cfg = load_user_config()
+        cfg = load_config(config_path)
     host_user = os.environ.get("USER") or getpass.getuser()
     host_uid = os.getuid()
     host_gid = os.getgid()
     home = os.environ.get("HOME") or os.path.expanduser("~")
     build_base(cfg, host_user=host_user, host_uid=host_uid, host_gid=host_gid, home=home)
     build_templates(cfg)
+    _write_stamp(_config_stamp(config_path))
     n = len(cfg.contexts)
-    print(f"setup: base + {n} context template(s) complete. "
-          "(stamp/reaper land in T8/T10.)")
+    print(f"setup: base + {n} context template(s) complete; stamp written. "
+          "(reaper lands in T10.)")
     return 0
+
+
+# --- run path: stamp drift, instance lifecycle, exec claude (DESIGN §9/§10) ---
+
+
+def _state_dir() -> Path:
+    """``$XDG_STATE_HOME/claude-wrapper`` (falling back to ``~/.local/state``).
+
+    Holds local, regenerable run-path state (the config stamp now; T10's
+    ``last-reap`` stamp later) — not config, so it lives outside the config dir.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.environ.get("HOME") or os.path.expanduser("~"), ".local", "state"
+    )
+    return Path(base) / "claude-wrapper"
+
+
+def _stamp_path() -> Path:
+    return _state_dir() / "stamp"
+
+
+def _config_stamp(config_path: str | os.PathLike[str]) -> str:
+    """``hash(schema_version + config.toml bytes)`` (DESIGN §10).
+
+    A cheap local fingerprint: a schema bump or any config edit changes it, so
+    the next run re-provisions exactly once.
+    """
+    import hashlib
+
+    h = hashlib.md5()
+    h.update(f"{SCHEMA_VERSION}\n".encode())
+    h.update(Path(config_path).read_bytes())
+    return h.hexdigest()
+
+
+def _read_stamp() -> str | None:
+    try:
+        return _stamp_path().read_text().strip()
+    except OSError:
+        return None
+
+
+def _write_stamp(value: str) -> None:
+    p = _stamp_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(value + "\n")
+
+
+# Terminal/locale vars forwarded so the TUI renders correctly; any ANTHROPIC_*/
+# CLAUDE_* host vars are forwarded too (API key, feature flags) — auth itself
+# still comes from the bind-mounted ~/.claude.json.
+_FORWARD_ENV = (
+    "TERM", "COLORTERM", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
+    "LC_MESSAGES", "LC_TIME", "LC_NUMERIC", "LC_COLLATE", "LC_MONETARY",
+)
+_FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_")
+
+
+def _exec_env(host_user: str, home: str) -> dict[str, str]:
+    """Env for ``exec claude``: identity, ``~/.local/bin`` PATH, forwarded vars.
+
+    PATH prepends ``$HOME/.local/bin`` (where the native installer puts claude;
+    DESIGN §12). HOME/USER are set explicitly even though the renamed identity
+    already matches, so the exec never relies on incus's env defaults.
+    """
+    env = {
+        "HOME": home,
+        "USER": host_user,
+        "PATH": f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:"
+                "/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+    for key, val in os.environ.items():
+        if key in _FORWARD_ENV or key.startswith(_FORWARD_PREFIXES):
+            env.setdefault(key, val)
+    return env
+
+
+def _add_session_mounts(instance: str, session_mounts: "list[Mount]") -> None:
+    """Add ad-hoc ``--mount`` modifiers as idempotent disk devices (DESIGN §9).
+
+    Caveat: these are per-invocation, but instances are scope-shared and
+    persistent, so a session mount lingers on the instance for later sessions in
+    the same scope. Accepted (the user opted in); we only add devices not already
+    present, so re-runs are no-ops and never error.
+    """
+    if not session_mounts:
+        return
+    specs = tuple(
+        MountSpec(path=os.path.abspath(os.path.expanduser(m.path)), mode=m.mode)
+        for m in session_mounts
+    )
+    existing = incus.device_show(instance)
+    new = tuple(s for s in specs if _mount_device_name(s) not in existing)
+    if new:
+        _add_mount_devices(instance, new)
+
+
+def _ensure_instance(
+    instance: str,
+    source: str,
+    *,
+    ctx_name: str,
+    scope: str,
+    add_project_mount: bool,
+) -> None:
+    """Ensure tier-3 *instance* exists (CoW of *source*) and is running (§4/§10).
+
+    Cold path (missing): CoW-copy from the context template (or ``claude-base``
+    for the *default* context), tag its tier, add the per-cwd project mount
+    unless the cwd is subsumed by a context mount, start, and wait for the agent
+    + DNS. Warm path: start it if stopped. Either way it is left running.
+    """
+    info = incus.instance_info(instance)
+    if info is None:
+        if not incus.container_exists(source):
+            raise SetupError(
+                f"source container {source!r} is missing — run "
+                "`claude-wrapper setup` to (re)build the base/templates."
+            )
+        print(f"Creating instance {instance} (CoW of {source})...")
+        incus.copy(source, instance)
+        incus.config_set(instance, ROLE_KEY, "instance")
+        incus.config_set(instance, CONTEXT_KEY, ctx_name)
+        if add_project_mount:
+            _add_mount_devices(instance, (MountSpec(path=scope),))
+        incus.start(instance)
+        _wait_for_agent(instance)
+        _wait_for_dns(instance)
+        return
+    if info.get("status") != "Running":
+        print(f"Starting instance {instance}...")
+        incus.start(instance)
+        _wait_for_agent(instance)
+
+
+def run(session_mounts: "list[Mount]", passthrough: list[str]) -> int:
+    """The run path (DESIGN §9/§10): stamp → resolve → instance → ``exec claude``.
+
+    Returns claude's own exit code. The instance is left running on exit; the
+    reaper that later stops/deletes idle instances is T10.
+    """
+    config_path = ensure_user_config()
+    cfg = load_config(config_path)
+
+    # Stamp drift (config edited, or first run) → exactly one auto-setup (§10).
+    if _read_stamp() != _config_stamp(config_path):
+        print("claude-wrapper: config changed (or first run) — running setup.")
+        setup(cfg)  # rebuilds base/templates and rewrites the stamp
+
+    host_user = os.environ.get("USER") or getpass.getuser()
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    cwd = os.getcwd()
+
+    res = resolve(cwd, cfg, home=home)  # RefuseError on a disallowed cwd (§8)
+
+    instance = f"{_template_name(res.context_name)}-{scope_hash(res.scope)}"
+    source = BASE if res.context is None else _template_name(res.context_name)
+
+    _ensure_instance(
+        instance,
+        source,
+        ctx_name=res.context_name,
+        scope=res.scope,
+        add_project_mount=res.add_project_mount,
+    )
+    _add_session_mounts(instance, session_mounts)
+    incus.config_set(instance, LAST_USED_KEY, str(int(time.time())))
+
+    return incus.exec_(
+        instance,
+        ["claude", *passthrough],
+        uid=1000,
+        gid=1000,
+        cwd=cwd,
+        env=_exec_env(host_user, home),
+        check=False,
+    )
