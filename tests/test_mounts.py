@@ -17,6 +17,8 @@ from claude_wrapper.mounts import (
     _is_within,
     check_cwd_allowed,
     compute_scope,
+    ensure_mask_dir,
+    mask_container_paths,
     resolve,
     resolve_context,
     scope_hash,
@@ -240,3 +242,44 @@ def test_resolve_default_context_with_project_mount():
 def test_resolve_runs_guard_first():
     with pytest.raises(RefuseError):
         resolve(HOME, Config(), home=HOME, project_root_fn=lambda _: None)
+
+
+# --- exclude masking (§8, §15.5) ---------------------------------------------
+
+
+def test_mask_paths_empty_without_exclude():
+    assert mask_container_paths(mount("/home/u/work")) == []
+
+
+def test_mask_paths_joins_exclude_onto_path():
+    spec = MountSpec(path="/home/u/work", exclude=("secrets",))
+    assert mask_container_paths(spec) == ["/home/u/work/secrets"]
+
+
+def test_mask_paths_multiple_and_nested():
+    spec = MountSpec(path="/home/u/wk", exclude=("a", "b/c"))
+    assert mask_container_paths(spec) == ["/home/u/wk/a", "/home/u/wk/b/c"]
+
+
+def test_mask_paths_leading_slash_is_relative_not_escape():
+    # A leading "/" must not escape the mount (os.path.join would otherwise
+    # discard the base) — it is treated as relative.
+    spec = MountSpec(path="/home/u/wk", exclude=("/secrets",))
+    assert mask_container_paths(spec) == ["/home/u/wk/secrets"]
+
+
+def test_mask_paths_normalised():
+    spec = MountSpec(path="/home/u/wk/", exclude=("./sub/",))
+    assert mask_container_paths(spec) == ["/home/u/wk/sub"]
+
+
+def test_ensure_mask_dir_creates_empty_555(tmp_path):
+    target = tmp_path / "cache" / "empty"
+    got = ensure_mask_dir(str(target))
+    assert got == str(target)
+    assert target.is_dir()
+    assert list(target.iterdir()) == []  # empty
+    assert (target.stat().st_mode & 0o777) == 0o555
+    # idempotent: a second call neither fails nor changes the result.
+    assert ensure_mask_dir(str(target)) == str(target)
+    assert (target.stat().st_mode & 0o777) == 0o555

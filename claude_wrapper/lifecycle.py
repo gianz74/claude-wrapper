@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import incus, provision
 from .config import Config, Context, MountSpec, load_user_config
+from .mounts import ensure_mask_dir, mask_container_paths
 
 # Tier 1: the frozen base. Tier-2 templates CoW-copy from it (T5); it is built
 # (started, provisioned) by setup, then stopped and never run again.
@@ -232,13 +233,29 @@ def _mount_device_name(spec: MountSpec) -> str:
     return "mnt-" + hashlib.md5(spec.path.encode()).hexdigest()[:8]
 
 
+def _mask_device_name(container_path: str) -> str:
+    """Device name for the empty-RO overmount masking *container_path* (§8).
+
+    The ``msk-`` prefix sorts after every ``mnt-`` parent device by name, which
+    — together with incus's path-depth mount ordering — guarantees a mask lands
+    *on top of* its parent mount, never under it.
+    """
+    import hashlib
+
+    return "msk-" + hashlib.md5(container_path.encode()).hexdigest()[:8]
+
+
 def _add_mount_devices(container: str, mounts: tuple[MountSpec, ...]) -> None:
     """Add persistent bind-mount disk devices for *mounts*; skip absent sources.
 
-    Per §7, host paths absent on this machine are skipped. ``spec.exclude``
-    masking (the nested empty-RO overmount) is intentionally deferred to T7.
+    Per §7, host paths absent on this machine are skipped. Each ``spec.exclude``
+    sub-path gets a nested empty read-only overmount (§8): a disk device sourcing
+    the shared empty dir (mode 555) at the excluded container path, added *after*
+    its parent so incus stacks the mask on top — the masked path then appears as
+    an empty, unwritable directory inside.
     """
     skipped: list[str] = []
+    mask_src: str | None = None
     for spec in mounts:
         src = spec.host_path
         if not os.path.exists(src):
@@ -248,6 +265,13 @@ def _add_mount_devices(container: str, mounts: tuple[MountSpec, ...]) -> None:
         if spec.mode == "ro":
             props["readonly"] = True
         incus.device_add(container, _mount_device_name(spec), "disk", **props)
+        for cpath in mask_container_paths(spec):
+            if mask_src is None:
+                mask_src = ensure_mask_dir()  # lazy: only when something is excluded
+            incus.device_add(
+                container, _mask_device_name(cpath), "disk",
+                source=mask_src, path=cpath, readonly=True,
+            )
     if skipped:
         print("Skipped absent mount sources:\n  " + "\n  ".join(skipped))
 

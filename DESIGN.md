@@ -295,6 +295,8 @@ The rewrite is "done" when each of these passes:
 
 ## 16. Open / deferred
 
-- Verify incus nested-device mount ordering for masking (§8).
+- ~~Verify incus nested-device mount ordering for masking (§8).~~ **Resolved (T7):**
+  incus stacks the mask on top of its parent — confirmed against the daemon, and
+  reinforced by `mnt-`/`msk-` device names that also sort parent-before-mask.
 - Optional `limits.memory` per instance as a hard guardrail (not default).
 - Hardlink-into-excluded-path edge case (§8) — accepted as out of scope.

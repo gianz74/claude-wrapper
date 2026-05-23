@@ -70,7 +70,7 @@ surface it rather than guessing.
   denylist (DESIGN §5/§6/§8). **Done when:** unit tests cover §15.3/§15.4/§15.7
   cases (incl. the `~/work/A` vs `/B` same-instance result).
 
-- [ ] **T7 — Masking + whitelist (`mounts.py`).** `exclude` → nested empty-RO
+- [x] **T7 — Masking + whitelist (`mounts.py`).** `exclude` → nested empty-RO
   overmount device; **verify incus applies nested device after parent**.
   **Done when:** §15.5 (excluded path empty inside) and §15.6 (whitelisted
   sibling absent) pass.
@@ -432,3 +432,56 @@ system roots refused, alias `from`/`path` refused, parity mount + out-of-home
 allowed); and the `resolve` orchestrator (covering, default+project-mount,
 guard-first). `git_project_root` smoke-tested against real git: repo root +
 subdir → toplevel; `/tmp` → None.
+
+### 2026-05-23 — T7: Masking + whitelist (`mounts.py` + `lifecycle._add_mount_devices`)
+
+**Changed:**
+- `mounts.py`: added the masking primitives — `MASK_DIR`
+  (`~/.cache/claude-wrapper/empty`), `mask_container_paths(spec)` (pure: joins
+  each relative `exclude` entry onto the container-side `path`, normpath'd;
+  strips a leading `/` so an entry can't escape the mount), and
+  `ensure_mask_dir(path=MASK_DIR)` (idempotent host I/O: create the shared empty
+  dir at **mode 555**, return its path; `path` injectable for tests).
+- `lifecycle.py`: added `_mask_device_name(container_path)` = `msk-<md5[:8]>`
+  and wired masking into `_add_mount_devices` — after each parent `mnt-*` disk
+  device, one nested `msk-*` disk device per excluded sub-path
+  (`source=<empty dir>`, `path=<excluded container path>`, `readonly=true`),
+  ensuring the empty dir lazily (only when something is actually excluded).
+  Imports `ensure_mask_dir, mask_container_paths` **by name** from `.mounts`
+  (not the module) so they don't shadow the `mounts` parameter.
+- `tests/test_mounts.py`: +6 unit tests (mask path join / nested / leading-slash
+  / normalise / empty; `ensure_mask_dir` creates-empty-555 + idempotent).
+
+**Decisions / gotchas for next tasks:**
+- **Device-ordering — VERIFIED against the real daemon (resolves the §16 open
+  item).** incus applies the mask *on top of* its parent: in the throwaway run
+  the excluded dir was empty and the real `secret.txt` unreadable. Two
+  independent guarantees stack: (a) incus mounts disk devices in target-path
+  depth order (parent shorter → first), and (b) the `mnt-`/`msk-` prefix split
+  makes **every** `msk-*` sort after **every** `mnt-*` by device name (verified:
+  `min(msks) > max(mnts)`). Either ordering rule alone suffices; both hold.
+- **Whitelist (§15.6) needed zero new code** — it's just "mount each allowed
+  path as its own entry"; the existing `_add_mount_devices` already does this and
+  the unmounted parent means a non-listed sibling is absent inside. Verified.
+- **`mask_container_paths` is keyed on the container-side `path`** (= `spec.path`,
+  not `host_path`); `exclude` entries are sub-paths *of the mount location*, so an
+  aliased mount masks relative to its container path. The mask `source` is always
+  the shared empty dir, never the host backing.
+- **Masking is unconditional on the excluded location** — added even if the host
+  sub-path doesn't currently exist (the overmount is a static default-deny on
+  that container path; cheap and future-proof). Masks are skipped only when the
+  *parent* source is absent (the whole mount is skipped, so there's nothing to
+  mask).
+- **`MASK_DIR` is host-shared across all instances/templates** — one dir, many
+  read-only bind mounts. mode 555 + `readonly=true` device are belt-and-suspenders
+  (verified: the masked path is read-only inside). T8/T10 don't need to special-
+  case mask devices — they propagate down the CoW chain by name like any `mnt-*`.
+
+**Verified:** `pytest -q` → **70 passed** (64 prior + 6 new), no regression;
+clean imports (no circular import from lifecycle→mounts). Throwaway integration
+run off `claude-base` (CoW → attach mounts via the real `_add_mount_devices` →
+start → assert as uid/gid 1000 → delete): **10/10 checks** — mask device created;
+`msk-*` sorts after `mnt-*`; public file readable; **excluded dir empty inside**;
+**real secret unreadable** (mask on top); masked path is a (read-only) dir;
+whitelisted A & B present + readable; **non-whitelisted sibling C absent**. Only
+`claude-base` (STOPPED) remains; temp dirs cleaned up.

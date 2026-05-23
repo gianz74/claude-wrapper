@@ -15,8 +15,11 @@ call (dependency-injected, so the core is unit-testable):
   scope, returning a :class:`Resolution`.
 * :func:`scope_hash` — the stable ``hash8(scope)`` keying instances; T8 joins it
   with ``lifecycle._template_name`` to form ``claude-sandbox-<ctx>-<hash8>`` (§5).
-
-``exclude`` masking + whitelist device logic is T7.
+* :func:`mask_container_paths` / :func:`ensure_mask_dir` — the ``exclude`` masking
+  primitives (§8): the container-side paths to overmount and the shared empty
+  read-only host dir bind-mounted on top of them. ``lifecycle._add_mount_devices``
+  turns these into the nested incus disk devices. The whitelist posture (§15.6)
+  needs no code here — it is just mounting each allowed path as its own entry.
 """
 
 from __future__ import annotations
@@ -161,6 +164,38 @@ def scope_hash(scope: str) -> str:
     so equal scopes share one instance (DESIGN §5).
     """
     return hashlib.md5(_norm(scope).encode()).hexdigest()[:8]
+
+
+# --- exclude masking (DESIGN §8) ---------------------------------------------
+
+# A single shared empty, read-only host dir bind-mounted over every excluded
+# sub-path. mode 555 (r-xr-xr-x): listable + traversable but unwritable, so a
+# masked path appears as an empty, unmodifiable directory inside the container.
+# `/dev/null` can't be used (file-over-directory type mismatch — §8).
+MASK_DIR = os.path.expanduser("~/.cache/claude-wrapper/empty")
+
+
+def mask_container_paths(spec: MountSpec) -> list[str]:
+    """Container-side paths to overmount with the empty dir for *spec* (§8).
+
+    ``spec.exclude`` entries are sub-paths *relative* to the mount ``path``
+    (config.py leaves them relative); join each onto the container-side ``path``.
+    A leading ``/`` on an entry is treated as relative (stripped) so it can never
+    escape the mount. Returns ``[]`` for a mount with no exclusions.
+    """
+    base = _norm(spec.path)
+    return [_norm(os.path.join(base, e.lstrip("/"))) for e in spec.exclude]
+
+
+def ensure_mask_dir(path: str = MASK_DIR) -> str:
+    """Create the shared empty mask dir (mode 555) if absent; return its path.
+
+    Idempotent host-side I/O — called lazily by the build path only when a mount
+    actually has exclusions. *path* is injectable for tests.
+    """
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, 0o555)
+    return path
 
 
 # --- launch guards: refuse-guard + cwd denylist (DESIGN §8) -------------------
