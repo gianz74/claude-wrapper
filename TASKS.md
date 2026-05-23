@@ -63,7 +63,7 @@ surface it rather than guessing.
   exist with correct devices, are STOPPED, and removing a context from config +
   `setup` prunes its template.
 
-- [ ] **T6 — Scope keying + resolution + guards (`mounts.py`, pure logic).**
+- [x] **T6 — Scope keying + resolution + guards (`mounts.py`, pure logic).**
   Context resolution (longest-prefix over `when` lists, OR semantics), scope =
   broadest covering context mount → project root (`git rev-parse --show-toplevel`)
   → cwd; subsumption rule; refuse-guard (cwd in any alias `from`/`path`); cwd
@@ -364,3 +364,71 @@ template is never run in prod); removing `t5b` from config + re-`build_templates
 branches of both `_prune_templates` and `_build_template` (warn + leave intact).
 All test containers + temp dirs cleaned up; `incus list` shows only
 `claude-base` STOPPED.
+
+### 2026-05-23 — T6: Scope keying + resolution + guards (`mounts.py`)
+
+**Changed:** Implemented `mounts.py` (host-only pure logic; the sole I/O is one
+injectable `git` call). Public surface: `RefuseError`; `Resolution`
+dataclass (`context`, `context_name`, `scope`, `add_project_mount`);
+`resolve_context` (§6 longest-prefix), `compute_scope` (§5 covering-mount →
+project root → cwd + subsumption flag), `check_cwd_allowed` (§8 refuse-guard +
+denylist), `resolve` (orchestrator: guard → context → scope), `scope_hash`
+(stable `md5[:8]`), `git_project_root` (the one impure helper). Added
+`tests/test_mounts.py` (33 tests).
+
+**Decisions / gotchas for next tasks:**
+- **Instance-name assembly is deferred to T8** (not in mounts.py). mounts.py
+  yields `scope` + `scope_hash(scope)`; **T8 forms the tier-3 name as**
+  `f"{lifecycle._template_name(ctx_name)}-{mounts.scope_hash(scope)}"`. Rationale:
+  the `claude-sandbox-` prefix + `_template_name` live in `lifecycle.py`; having
+  mounts.py build the full name would duplicate the prefix or risk a circular
+  import, and instance creation/tagging is squarely T8's charter. **Note for T8:**
+  `context_name` is `"default"` (= `mounts.DEFAULT_CONTEXT`) when no context
+  matches — and per §4/§5/§6 a `default` instance has **no tier-2 template**, so
+  T8 must CoW it from **`claude-base`** directly (every configured context CoWs
+  from its `claude-sandbox-<ctx>` template).
+- **`scope_hash` = `md5(normpath(scope))[:8]`** — same algorithm as
+  `lifecycle._mount_device_name` but keyed on the scope path. Equal scopes ⇒
+  equal hash ⇒ shared instance (the §15.4 mechanism).
+- **`Resolution.scope` doubles as the project-mount host path** when
+  `add_project_mount` is True (a parity rw mount of the scope dir). When False
+  the cwd is subsumed by a context mount, so **T8 adds no project mount** (§5).
+- **Run-path order for T8 (matches `resolve`):** guard **first**
+  (`check_cwd_allowed` raises `RefuseError` before any resolution), then context,
+  then scope. T8/cli must catch `mounts.RefuseError` → stderr + rc 1 (alongside
+  the existing `ConfigError`/`SetupError`/`IncusError` handling in `cmd_setup`).
+- **`compute_scope`/`resolve` take an injectable `project_root_fn`** (defaults to
+  `git_project_root`). Tests pass a stub to stay hermetic; **T8 just calls
+  `resolve(cwd, cfg, home=…)` and lets it shell out to git** (only when the cwd
+  isn't subsumed — `compute_scope` skips the git call when a covering mount hits).
+- **Covering mount = broadest (shortest `path`) context mount containing the
+  cwd**, over `context.mounts` only (global mounts are auth/config, never a
+  workspace). Keyed on `spec.path` (container-side); the refuse-guard guarantees
+  a valid cwd is never under an *alias* path, so the covering mount is always
+  parity (`path` == host backing) and the choice is unambiguous.
+- **Tie-break = config order** for equal-length `when` prefixes (§6 allowed
+  "config order *or* a setup-time error"; chose config order — simpler, and this
+  is the run path, not setup). A true tie requires two contexts to list the
+  *identical* prefix; `resolve_context` uses strict `>` so the earlier config
+  entry wins.
+- **Denylist semantics (§8):** `$HOME` and `/` are **exact**-match denials
+  (subdirs are fine); system roots (`/etc /usr /bin /boot /dev /proc /sys /run
+  /var`) and alias dirs deny **at-or-under**. Out-of-home dirs (`/tmp/…`,
+  `/opt/…`) are intentionally allowed. `_is_within` is **component-wise** (so
+  `/a/bc` is not within `/a/b`). Paths are `normpath`-compared; symlinks are
+  **not** resolved (DESIGN relies on literal host/container path identity).
+- **Refuse-guard** forbids cwd at/under **either side** of any `from`-bearing
+  mount (container `path` and host backing), scanned across global + all context
+  mounts independent of which context the cwd resolves to.
+
+**Verified:** `pytest -q` → **64 passed** (31 prior + 33 new), no regression.
+New tests cover: `_is_within` boundary (incl. `/a/bc` ∉ `/a/b`); §6 resolution
+(no-match→default, simple, longest-prefix-wins both orders, OR semantics,
+exact-length tie→config order); §15.4 covering-mount (A & B same scope/hash, no
+project mount) + broadest-of-nested; §15.3 per-cwd isolation (distinct project
+roots → distinct scopes/hashes, each with a project mount) + cwd fallback when
+no repo; §15.7 guards ($HOME exact refused but subdir allowed, `/` refused,
+system roots refused, alias `from`/`path` refused, parity mount + out-of-home
+allowed); and the `resolve` orchestrator (covering, default+project-mount,
+guard-first). `git_project_root` smoke-tested against real git: repo root +
+subdir → toplevel; `/tmp` → None.
