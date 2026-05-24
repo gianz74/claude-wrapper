@@ -308,7 +308,7 @@ surface it rather than guessing.
   skip, and build-id insensitivity. Verify the merged env on a real `exec claude`
   (a throwaway `printenv` is enough — no full TUI).
 
-- [ ] **T17 — Build-relevant config stamp (`lifecycle._config_stamp`, DESIGN §10).**
+- [x] **T17 — Build-relevant config stamp (`lifecycle._config_stamp`, DESIGN §10).**
   Stop runtime-only config edits from forcing a full rebuild, and start catching
   provision-script content edits that are currently silently ignored, by keying
   the auto-`setup` stamp on the config's **build identity** instead of raw
@@ -1521,3 +1521,61 @@ preserved — all reached the sandbox at exec time. Throwaway deleted; `claude-b
 untouched. **Project is now T1–T16 complete.** Not exercised: a full interactive
 TUI (printenv proves env passing; T8 already proved claude launches) and the
 `@`-username leg (host is gianz/1000).
+
+### 2026-05-24 — T17: Build-relevant config stamp (`lifecycle._config_stamp`)
+
+**Changed (`lifecycle.py` only — pure local logic, no daemon/rootfs touched):**
+- Re-keyed `_config_stamp` from `hash(SCHEMA_VERSION + config.toml bytes)` to a
+  hash of the config's **build identity**: `_base_build_id(cfg)` plus each
+  context's `_template_build_id(base_id, ctx)`, sorted for stability, hashed
+  together (`md5` of a `sort_keys` JSON `{base, templates}`). **Signature change**
+  `_config_stamp(config_path)` → `_config_stamp(cfg: Config)`. `SCHEMA_VERSION`
+  stays covered (folded in by `_base_build_id`) so the separate prepend is gone.
+- Updated both callers (each already held `cfg`): `setup` (`:745`) writes
+  `_config_stamp(cfg)`; `run`'s drift gate (`:1011`) compares against
+  `_config_stamp(cfg)`. `config_path` is still used by `ensure_user_config`/
+  `load_config` in both — not orphaned.
+- Rewrote `tests/test_lifecycle_stamp.py` for the new `Config`-based signature
+  (the old tests passed `Path`s): 13 tests (was 5).
+
+**Decisions / gotchas:**
+- **This is now the single source of truth** for both the auto-`setup` trigger
+  and T12's instance-recreation decision — they call the *same* build-id
+  functions, so they can no longer disagree (a config edit that recreates
+  instances also auto-`setup`s, and vice versa). Noted in the docstring.
+- **Two payoffs, one change:** (a) runtime-only edits — `[env]` (T16),
+  `[reaper]` thresholds — are absent from every build-id, so they no longer
+  drift the stamp / force a rebuild (this *completes* §15.12's deferred
+  stamp-skip half that T16 flagged); (b) a provision-script *content* edit with
+  `config.toml` byte-identical now drifts the stamp (the build-ids read the
+  script via `_read_provision`), where before it was inert until a manual
+  `setup`. Context add/remove/rename still drifts (the set of template ids
+  changes). `[vars]`/`[mount_groups]` are already flattened into mounts/paths
+  before the build-id sees them, so a `${VAR}` in a *mount* still drifts
+  (correct) while one used only in an `[env]` literal does not.
+- **§15.2 budget preserved by construction (no integration run needed):** the
+  stamp check runs before any daemon interaction in `run`; the new
+  `_config_stamp` does only **local file reads** (the provision scripts) +
+  hashing — **zero daemon calls**, same as the old byte-read. The warm path is
+  still `list_instances` (T12) + `config_set`(last-used) + `exec` = 3 calls, 2
+  before claude. Like T15, this is pure logic with no daemon-side change, so
+  Done-when is unit-test-only.
+- **One-time migration:** on-disk stamps written by the old byte-hash scheme
+  mismatch the new build-id hash once → **one harmless auto-`setup`** on the
+  first run after this upgrade (base/templates are content-identical if nothing
+  build-relevant changed, so T12 won't churn instances either — only the stamp
+  is rewritten), then stable. No `SCHEMA_VERSION` bump (local-stamp logic;
+  template/config shape unchanged).
+- **No DESIGN change** — §10's stamp bullet, §7.3's env caveat, and §15.13 were
+  already amended in the T17 design commit (`54e6215`); this session only
+  implements them.
+
+**Verified:** `python3 -m pytest -q` → **181 passed** (173 prior − 5 replaced
+stamp tests + 13 new). New tests cover the §15.13 cases: **stable** across an
+`[env]`/`[reaper]`/context-`env` edit (equal stamp); **drifts** on a package, a
+global-mount field (`mode`), context add/remove, a context-mount change; and
+**drifts on provision-content change** (global + per-context, `config.toml` shape
+identical, just rewriting the script's bytes) — plus schema-bump coverage and the
+read/write + drift-cycle round-trips (incl. a runtime-only `[env]` edit staying a
+match). Clean import; no daemon interaction so no throwaway run (mirrors T15).
+**Project is now T1–T17 complete (the full TASKS.md list).**

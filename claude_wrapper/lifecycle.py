@@ -742,7 +742,7 @@ def setup(cfg: Config | None = None) -> int:
         home=home, build_id=base_id,
     )
     build_templates(cfg, base_id)
-    _write_stamp(_config_stamp(config_path))
+    _write_stamp(_config_stamp(cfg))
     result = reap(cfg)
     _write_reap_stamp(int(time.time()))
     n = len(cfg.contexts)
@@ -773,18 +773,31 @@ def _stamp_path() -> Path:
     return _state_dir() / "stamp"
 
 
-def _config_stamp(config_path: str | os.PathLike[str]) -> str:
-    """``hash(schema_version + config.toml bytes)`` (DESIGN §10).
+def _config_stamp(cfg: Config) -> str:
+    """Hash of the config's *build identity* — the auto-``setup`` drift key (§10).
 
-    A cheap local fingerprint: a schema bump or any config edit changes it, so
-    the next run re-provisions exactly once.
+    Keyed on the same build-ids that decide what touches the rootfs (and so what
+    T12 recreates): ``_base_build_id`` (schema + global packages + global
+    provision-script *content* + global mounts) plus each context's
+    ``_template_build_id`` (its mounts + provision content), sorted for
+    stability. This is the *single source of truth* shared with T12's
+    instance-recreation decision, so the auto-``setup`` trigger and the
+    instance-staleness check can never disagree.
+
+    Two consequences vs. the old ``hash(SCHEMA_VERSION + config.toml bytes)``:
+    runtime-only edits (``[env]`` per §7.3, ``[reaper]`` thresholds) are absent
+    from every build-id, so they no longer drift the stamp / force a rebuild;
+    and a provision-script *content* edit now drifts it even with ``config.toml``
+    byte-identical (the build-ids read the script contents), where before it was
+    inert until a manual ``setup``. ``SCHEMA_VERSION`` stays covered because
+    ``_base_build_id`` folds it in.
     """
     import hashlib
 
-    h = hashlib.md5()
-    h.update(f"{SCHEMA_VERSION}\n".encode())
-    h.update(Path(config_path).read_bytes())
-    return h.hexdigest()
+    base_id = _base_build_id(cfg)
+    template_ids = sorted(_template_build_id(base_id, ctx) for ctx in cfg.contexts)
+    payload = json.dumps({"base": base_id, "templates": template_ids}, sort_keys=True)
+    return hashlib.md5(payload.encode()).hexdigest()
 
 
 def _read_stamp() -> str | None:
@@ -996,8 +1009,10 @@ def run(session_mounts: "list[Mount]", passthrough: list[str]) -> int:
     config_path = ensure_user_config()
     cfg = load_config(config_path)
 
-    # Stamp drift (config edited, or first run) → exactly one auto-setup (§10).
-    if _read_stamp() != _config_stamp(config_path):
+    # Stamp drift (build-relevant config edited, or first run) → one auto-setup
+    # (§10). Keyed on build identity, so runtime-only edits ([env]/[reaper]) skip
+    # this and a provision-content change triggers it (DESIGN §7.3/§10/§15.13).
+    if _read_stamp() != _config_stamp(cfg):
         print("claude-wrapper: config changed (or first run) — running setup.")
         setup(cfg)  # rebuilds base/templates and rewrites the stamp
 
