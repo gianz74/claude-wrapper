@@ -41,10 +41,33 @@ def test_global_literal_and_forward(monkeypatch):
 
 
 def test_builtin_baseline_forwarded(monkeypatch):
-    # TERM is in the always-forwarded baseline (§12) — present with no config.
+    # TERM is in the always-forwarded universal baseline (§12) — present with no
+    # config. This baseline must stay narrow (terminal/locale + IDE hints).
     monkeypatch.setenv("TERM", "xterm-256color")
     env = lifecycle._exec_env(Config(), None, "u", "/home/u")
     assert env["TERM"] == "xterm-256color"
+
+
+# --- deployment knobs are relocated out of the baseline (T19, §7.3) ----------
+
+
+def test_relocated_var_not_forwarded_by_default(monkeypatch):
+    # Proxy/cloud/cert knobs were removed from the hardcoded baseline — present
+    # on the host but NOT forwarded unless the config names them in [env].forward.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+    monkeypatch.setenv("CLOUD_ML_REGION", "us-east5")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/creds.json")
+    env = lifecycle._exec_env(Config(), None, "u", "/home/u")
+    assert "HTTPS_PROXY" not in env
+    assert "CLOUD_ML_REGION" not in env
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
+
+
+def test_relocated_var_forwarded_when_named(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+    cfg = Config(forward=("HTTPS_PROXY",))
+    env = lifecycle._exec_env(cfg, None, "u", "/home/u")
+    assert env["HTTPS_PROXY"] == "http://proxy:8080"
 
 
 # --- precedence (only literal vs forwarded can differ in value) --------------

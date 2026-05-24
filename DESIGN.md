@@ -278,6 +278,18 @@ env  = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }  # [contexts.env] sub-t
   `forward = [...]` is a list of host var *names* whose values are taken from the
   launching shell. A host var named in `forward` that is unset is **silently
   skipped** (same convention as a host path absent on this machine).
+- **Hardcoded baseline is universal only.** What the wrapper forwards with no
+  config (`_FORWARD_ENV` + prefixes) is just terminal/locale, IDE hints, and the
+  `ANTHROPIC_`/`CLAUDE_` prefixes (a prefix can't be a `forward` name, so it
+  stays in code). **Deployment-specific knobs are *not* baked in** — proxy
+  (`HTTP(S)_PROXY`/`NO_PROXY` + lowercase), cloud (`CLOUD_ML_REGION`,
+  `GOOGLE_APPLICATION_CREDENTIALS`), and cert (`NODE_EXTRA_CA_CERTS`) vars are
+  forwarded **only** when a machine lists them in its global `[env].forward`
+  (the shipped example does). This keeps the package generic (no baked-in
+  proxy/cloud assumptions); a Bedrock host likewise re-adds its `AWS_*` creds by
+  name. Consequence: the shipped config is *documentation, not an auto-loaded
+  default*, so these vars aren't forwarded on any machine until its real
+  `config.toml` names them.
 - **`forward` is a reserved key** inside an `[env]` table (lowercase; env names
   are conventionally UPPERCASE, so no real collision). Everything else in the
   table is a literal pair.

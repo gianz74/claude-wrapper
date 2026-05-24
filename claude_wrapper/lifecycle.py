@@ -851,18 +851,19 @@ def _reap_due(now: int | None = None) -> bool:
     return last is None or (now - last) > REAP_INTERVAL_S
 
 
-# Host env forwarded into the exec. Terminal/locale so the TUI renders right;
-# IDE hints so claude-code-ide recognises its host (§12); cloud/proxy/cert knobs
-# claude honours. The matching credential *files* are exposed via config
-# [[mounts]] (DESIGN §7), not hardcoded here. ANTHROPIC_*/CLAUDE_* are
-# forwarded by prefix (covers the API key, feature flags, CLAUDE_CODE_SSE_PORT).
+# Host env always forwarded into the exec — the *universal* baseline, nothing to
+# configure: terminal/locale so the TUI renders right, and IDE hints so
+# claude-code-ide recognises its host (§12). ANTHROPIC_*/CLAUDE_* are forwarded
+# by prefix (covers the API key, feature flags, CLAUDE_CODE_SSE_PORT) — a prefix
+# can't be a `forward = [...]` name, so it stays here. Deployment-specific knobs
+# (proxy/cloud/cert vars, Bedrock AWS_* creds) are deliberately NOT baked in: the
+# package stays generic, so a machine that needs them lists them by name in its
+# config's global [env].forward (DESIGN §7.3 — the shipped example shows the
+# common proxy/cloud set). Credential *files* are exposed via [[mounts]] (§7).
 _FORWARD_ENV = (
     "TERM", "COLORTERM", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
     "LC_MESSAGES", "LC_TIME", "LC_NUMERIC", "LC_COLLATE", "LC_MONETARY",
     "TERM_PROGRAM", "FORCE_CODE_TERMINAL",
-    "CLOUD_ML_REGION", "NODE_EXTRA_CA_CERTS", "GOOGLE_APPLICATION_CREDENTIALS",
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "no_proxy",
 )
 _FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_")
 

@@ -405,7 +405,7 @@ surface it rather than guessing.
   rule and the absolute/`[vars]` workaround. No `SCHEMA_VERSION`/build-id impact
   either way (env + `[vars]` are already runtime-only / pre-flattened per T17).
 
-- [ ] **T19 — Surface deployment-specific forwarded env into config (`[env].forward`,
+- [x] **T19 — Surface deployment-specific forwarded env into config (`[env].forward`,
   DESIGN §7.3/§12).** The hardcoded `_FORWARD_ENV` baseline in `lifecycle.py` bakes
   machine/deployment-specific vars into the otherwise-generic package. Relocate the
   deployment-specific forwards into the **shipped example config's global
@@ -1706,3 +1706,55 @@ mechanism), works on both sides of every mount (host HOME/USER == container's,
 repo root confirmed `GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"` →
 `/home/gianz/.config/git/config`. No daemon interaction, so no throwaway run.
 **Project is now T1–T18 complete.**
+
+### 2026-05-24 — T19: Surface deployment-specific forwarded env into config
+
+**Design call (already recorded 2026-05-24 with the repo scrub):** the hardcoded
+`_FORWARD_ENV` baked deployment-specific forwards into a package meant to be
+generic. Trim it to the *universal* baseline; relocate the deployment knobs to
+the shipped example config's global `[env].forward` (T16 already provides the
+mechanism). Behavioral consequence is intentional: the shipped config is
+**documentation, not an auto-loaded default**, so the relocated vars are no
+longer forwarded on *any* machine until its real `config.toml` names them.
+
+**Changed:**
+- `lifecycle.py`: trimmed `_FORWARD_ENV` to the universal set —
+  terminal/locale (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`) + IDE hints
+  (`TERM_PROGRAM`, `FORCE_CODE_TERMINAL`). `_FORWARD_PREFIXES`
+  (`ANTHROPIC_`/`CLAUDE_`) unchanged (a prefix can't be a `forward` name, so it
+  must stay in code). **Removed** (now config-only): `HTTP_PROXY`/`HTTPS_PROXY`/
+  `NO_PROXY` (+ lowercase), `NODE_EXTRA_CA_CERTS`, `CLOUD_ML_REGION`,
+  `GOOGLE_APPLICATION_CREDENTIALS`. Comment rewritten to explain the split.
+- `config.py` `_DEFAULT_CONFIG_TOML`: the commented `[env]` example now carries a
+  multi-line `forward = [...]` listing the relocated proxy/cloud/cert vars, with
+  a note that deployment knobs aren't baked in (Bedrock host adds `AWS_*` by name).
+- `DESIGN.md` §7.3: added a "Hardcoded baseline is universal only" bullet naming
+  the relocated vars + the documentation-not-default consequence. §7.3's opening
+  already described the narrow baseline (terminal/locale, IDE hints, prefixes), so
+  it was already correct. **§12 unchanged** — its table never echoed the forward
+  var list (only the `~/.local/bin` PATH/launcher rows + the §7.3 prefix cross-ref).
+- `README.md`: added an `[env]` block to the config example and a `[env]` bullet
+  to "Key config concepts" stating only the universal baseline is hardcoded and
+  deployment knobs must be listed in `[env].forward`.
+- `tests/test_exec_env.py`: kept the `TERM` baseline test (annotated that the
+  baseline must stay narrow); +2 tests — a relocated var (`HTTPS_PROXY` +
+  `CLOUD_ML_REGION` + `GOOGLE_APPLICATION_CREDENTIALS`) set on the host is **not**
+  forwarded with a default `Config`, but **is** when named in `[env].forward`.
+
+**Decisions / gotchas:**
+- **No `SCHEMA_VERSION`/build-id impact** — env is run-path-only (T16/T17). The
+  pre-existing `test_base_build_id_ignores_env`/`test_template_build_id_ignores_env`
+  still pin this; nothing in this task touched a build-id or the schema.
+- **Unit-test-only verification** (like T15/T17): this is a forward-list refactor
+  + docs with no daemon-side change. T16 already verified real env passing via a
+  `printenv` exec; removing names from the always-forward list is fully covered by
+  the not-forwarded-by-default / forwarded-when-named unit pair. No throwaway run.
+- **Migration note for existing machines:** anyone relying on the old implicit
+  proxy/cloud forwarding must now add those names to their real `config.toml`'s
+  `[env].forward` — they stop being forwarded silently after this upgrade. This is
+  the intended generic-package behavior, but it's a behavior change for live hosts.
+
+**Verified:** `python3 -m pytest -q` → **187 passed** (was 185; +2). Shipped
+default config re-parses cleanly (the `[env]` example stays commented →
+`forward=()`, `env={}`). No residual relocated-var references in `lifecycle.py`.
+**Project is now T1–T19 complete — the full TASKS.md list.**

@@ -137,6 +137,10 @@ stop_idle_after     = "30m"               # running + idle this long  -> stop
 delete_unused_after = "14d"               # not used this long        -> delete
 max_instances       = 0                   # 0 = unlimited; else LRU-trim
 
+[env]                                     # §7.3 — extra env at `exec claude`
+GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"   # literal; ${HOME} expands
+forward = ["GH_TOKEN", "HTTPS_PROXY", "NO_PROXY"]  # host vars passed by name
+
 # Global mounts: baked into claude-base, inherited everywhere. Shared auth/history.
 [[mounts]]
 path = "~/.claude"
@@ -169,6 +173,12 @@ Key config concepts:
 - **Mount groups (§7.2)** — a named, reusable bundle of mounts that contexts
   `include`. A group is *not* a context: no `when`, no template, no instance. An
   inline `[[contexts.mounts]]` overrides an included mount with the same `path`.
+- **`[env]` (§7.3)** — extra env injected at `exec claude` (run-path only, never
+  baked in, so an edit never rebuilds). Literal `KEY = "value"` pairs plus a
+  `forward` list of host var names. Only a *universal* baseline (terminal/locale,
+  IDE hints, `ANTHROPIC_*`/`CLAUDE_*`) is hardcoded; deployment knobs
+  (proxy/cloud/cert vars, Bedrock `AWS_*`) are **not** forwarded by default —
+  list the ones this machine needs in `[env].forward`.
 - **Masking / whitelist (§8)** — `exclude` overmounts a sub-path with an empty
   read-only dir (a blacklist; default-expose). For secrets material prefer the
   **whitelist** posture: mount each allowed repo as its own entry so anything not

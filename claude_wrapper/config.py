@@ -591,7 +591,7 @@ max_instances       = 0       # 0 = unlimited; else LRU-delete beyond this
 
 # --- Environment (§7.3) -------------------------------------------------------
 # Extra env passed into the sandbox at `exec claude`, on top of the always-
-# forwarded baseline (terminal/locale, IDE hints, ANTHROPIC_*/CLAUDE_*).
+# forwarded *universal* baseline (terminal/locale, IDE hints, ANTHROPIC_*/CLAUDE_*).
 # Run-path-only: applied at launch, never baked in, so an [env] edit never
 # rebuilds or recreates an instance. Literal KEY = "value" sets it verbatim
 # (${VAR} from [vars] expands; no ~ expansion); the reserved `forward` key lists
@@ -601,10 +601,20 @@ max_instances       = 0       # 0 = unlimited; else LRU-delete beyond this
 # expanded; for a home-relative path use ${HOME} (e.g. to point git at a config
 # inside a *directory* mount, since a single-file ~/.gitconfig bind mount can't
 # be rewritten atomically).
+#
+# Deployment knobs are NOT baked into the package (it stays generic): proxy,
+# cloud, and cert vars are no longer forwarded by default — list the ones THIS
+# machine needs in `forward` below. A Bedrock host likewise adds its AWS_* creds
+# by name.
 # [env]
 # EDITOR             = "vim"
 # GIT_CONFIG_GLOBAL  = "${HOME}/.config/git/config"
-# forward            = ["GH_TOKEN"]
+# forward = [
+#   "GH_TOKEN",
+#   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+#   "http_proxy", "https_proxy", "no_proxy",
+#   "NODE_EXTRA_CA_CERTS", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
+# ]
 
 # --- Global persistent mounts: baked into claude-base, inherited everywhere ---
 # `path` is the mount location (host & container identical). `from` aliases a
