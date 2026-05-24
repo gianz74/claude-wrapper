@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +45,12 @@ _DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhd]?)\s*$")
 # Brace form only — a bare ``$NAME`` is left literal so paths containing ``$``
 # survive untouched. Names match a conventional identifier.
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# Environment-variable names (literals + ``forward`` entries) must be valid shell
+# identifiers (DESIGN §7.3). ``HOME``/``USER``/``PATH`` are reserved — identity
+# (§3) + the private claude launcher PATH (§11) — and rejected in any ``[env]``.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_ENV = ("HOME", "USER", "PATH")
 
 
 class ConfigError(Exception):
@@ -97,6 +104,10 @@ class Context:
     when: tuple[str, ...]  # host path prefixes (OR), ~-expanded
     provision_script: str | None = None  # ~-expanded
     mounts: tuple[MountSpec, ...] = ()
+    # Per-context env (DESIGN §7.3): literal pairs + ``forward`` host var names.
+    # Run-path-only — applied at ``exec claude``, never baked into a template.
+    env: Mapping[str, str] = field(default_factory=dict)
+    forward: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,10 @@ class Config:
     reaper: ReaperConfig = field(default_factory=ReaperConfig)
     mounts: tuple[MountSpec, ...] = ()  # global, baked into claude-base
     contexts: tuple[Context, ...] = ()
+    # Global env (DESIGN §7.3): merged broadest-first with each context's own env
+    # at ``exec`` time. Run-path-only, so absent from the §4/§10 build identity.
+    env: Mapping[str, str] = field(default_factory=dict)
+    forward: tuple[str, ...] = ()
 
 
 # --- locations ---------------------------------------------------------------
@@ -283,6 +298,53 @@ def _parse_reaper(raw: object) -> ReaperConfig:
     )
 
 
+# --- environment (`[env]` + context `env`, DESIGN §7.3) ----------------------
+
+
+def _parse_env(raw: object, where: str) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Parse an ``[env]`` / per-context ``env`` table.
+
+    Returns ``(literals, forward)``: the reserved lowercase key ``forward`` is a
+    ``list[str]`` of host var names; every other pair is a literal ``KEY = "value"``.
+    Validates env-name shape, string values, and rejects the reserved
+    ``HOME``/``USER``/``PATH`` (identity §3 + launcher §11). ``${VAR}`` (§7.1) is
+    already expanded into literal values by the pre-pass; env values are *not*
+    ``~``-expanded (they are not paths).
+    """
+    if raw is None:
+        return {}, ()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: expected a table")
+    forward: tuple[str, ...] = ()
+    literals: dict[str, str] = {}
+    for key, value in raw.items():
+        if key == "forward":
+            forward = _str_list(value, f"{where}.forward")
+            for name in forward:
+                _check_env_name(name, f"{where}.forward")
+            continue
+        _check_env_name(key, where)
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"{where}.{key}: expected a string, got {type(value).__name__}"
+            )
+        literals[key] = value
+    return literals, forward
+
+
+def _check_env_name(name: str, where: str) -> None:
+    if not _ENV_NAME_RE.match(name):
+        raise ConfigError(
+            f"{where}: invalid environment variable name {name!r} "
+            "(expected letters, digits and underscores)"
+        )
+    if name in _RESERVED_ENV:
+        raise ConfigError(
+            f"{where}: {name} is reserved (identity + launcher PATH) "
+            "and may not be set in [env]"
+        )
+
+
 # --- mount groups (`[mount_groups]` + context `include`, DESIGN §7.2) --------
 
 
@@ -366,11 +428,15 @@ def _parse_context(
             )
         included.append(groups[gname])
 
+    env, forward = _parse_env(raw.get("env"), f"context {name!r}.env")
+
     return Context(
         name=name,
         when=when,
         provision_script=_expand(script) if script is not None else None,
         mounts=_flatten_context_mounts(included, inline_mounts),
+        env=env,
+        forward=forward,
     )
 
 
@@ -421,11 +487,15 @@ def parse_config(data: dict, *, source: str = "<config>") -> Config:
             "context name 'default' is reserved for the no-context fallback"
         )
 
+    env, forward = _parse_env(data.get("env"), "[env]")
+
     return Config(
         setup=_parse_setup(data.get("setup")),
         reaper=_parse_reaper(data.get("reaper")),
         mounts=global_mounts,
         contexts=contexts,
+        env=env,
+        forward=forward,
     )
 
 
@@ -497,6 +567,19 @@ stop_idle_after     = "30m"   # running + idle this long  -> stop
 delete_unused_after = "14d"   # not used this long        -> delete instance
 max_instances       = 0       # 0 = unlimited; else LRU-delete beyond this
 
+# --- Environment (§7.3) -------------------------------------------------------
+# Extra env passed into the sandbox at `exec claude`, on top of the always-
+# forwarded baseline (terminal/locale, IDE hints, ANTHROPIC_*/CLAUDE_*/AWS_*).
+# Run-path-only: applied at launch, never baked in, so an [env] edit never
+# rebuilds or recreates an instance. Literal KEY = "value" sets it verbatim
+# (${VAR} from [vars] expands; no ~ expansion); the reserved `forward` key lists
+# host var names passed through by value (an unset host var is skipped). A
+# per-context `env` overrides the global one on a key collision.
+# HOME/USER/PATH are reserved and rejected.
+# [env]
+# EDITOR  = "vim"
+# forward = ["GH_TOKEN"]
+
 # --- Global persistent mounts: baked into claude-base, inherited everywhere ---
 # `path` is the mount location (host & container identical). `from` aliases a
 # different host backing dir. Default mode is rw; mark credentials `ro`.
@@ -536,6 +619,7 @@ path = "~/.claude.json"
 # when    = ["~/work/acme-api"]
 # include = ["acme-creds"]
 # provision_script = "~/.config/claude-wrapper/provision-api.sh"
+# env     = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }  # overrides global [env]
 #   [[contexts.mounts]]
 #   path    = "~/work"  # whole-tree mount (broad)
 #   exclude = ["secrets"]  # masked: appears as an empty read-only dir

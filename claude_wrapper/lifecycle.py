@@ -854,8 +854,10 @@ _FORWARD_ENV = (
 _FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "AWS_")
 
 
-def _exec_env(host_user: str, home: str) -> dict[str, str]:
-    """Env for ``exec claude``: identity, claude-launcher PATH, forwarded vars.
+def _exec_env(
+    cfg: Config, context: "Context | None", host_user: str, home: str
+) -> dict[str, str]:
+    """Env for ``exec claude``: identity, claude-launcher PATH, forwarded + user vars.
 
     PATH prepends the container-private launcher dir (:data:`LAUNCHER_DIR`) ahead
     of ``$HOME/.local/bin`` (where the native installer puts claude; DESIGN
@@ -863,16 +865,39 @@ def _exec_env(host_user: str, home: str) -> dict[str, str]:
     over the container's, so bare ``claude`` always resolves to the container's
     own binary. HOME/USER are set explicitly even though the renamed identity
     already matches, so the exec never relies on incus's env defaults.
+
+    User-declared env (DESIGN §7.3) is merged broadest→narrowest, later-wins:
+    identity → built-in forwarded baseline (``setdefault``) → user ``forward``
+    (global ∪ context, pulled from ``os.environ``, skipped if unset) → user
+    literals (global, then context overrides global; literals override forwarded)
+    → identity re-asserted last so nothing clobbers HOME/USER/PATH. Env is a
+    run-path concern only — it touches no rootfs and is never part of the §4
+    build identity.
     """
-    env = {
+    identity = {
         "HOME": home,
         "USER": host_user,
         "PATH": f"{LAUNCHER_DIR}:{home}/.local/bin:/usr/local/sbin:/usr/local/bin:"
                 "/usr/sbin:/usr/bin:/sbin:/bin",
     }
+    env = dict(identity)
+    # (2) built-in forwarded baseline — setdefault so it never clobbers identity.
     for key, val in os.environ.items():
         if key in _FORWARD_ENV or key.startswith(_FORWARD_PREFIXES):
             env.setdefault(key, val)
+    # (3) user `forward` = global ∪ context names, by value; unset host var skipped.
+    forward_names = list(cfg.forward)
+    if context is not None:
+        forward_names += list(context.forward)
+    for name in forward_names:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    # (4) user literals: global, then context overrides global (literals beat forwarded).
+    env.update(cfg.env)
+    if context is not None:
+        env.update(context.env)
+    # (5) re-assert identity last (config rejects HOME/USER/PATH in [env], so belt-and-suspenders).
+    env.update(identity)
     return env
 
 
@@ -1021,7 +1046,7 @@ def run(session_mounts: "list[Mount]", passthrough: list[str]) -> int:
                 uid=1000,
                 gid=1000,
                 cwd=cwd,
-                env=_exec_env(host_user, home),
+                env=_exec_env(cfg, res.context, host_user, home),
                 check=False,
             )
     finally:

@@ -258,7 +258,7 @@ surface it rather than guessing.
   token is constant per context and `!=` the bare template name. `pytest -q`
   green with no regression.
 
-- [ ] **T16 — User-declared env (`config.py` + `lifecycle._exec_env`, DESIGN §7.3).**
+- [x] **T16 — User-declared env (`config.py` + `lifecycle._exec_env`, DESIGN §7.3).**
   Let the config pass extra environment into the sandbox, both global and
   per-context, as literal values **and** host pass-through — beyond the hardcoded
   `_FORWARD_ENV`/prefix baseline. **Env is run-path-only** (applied at `exec
@@ -1452,3 +1452,72 @@ True per project (§15.3 preserved); (4)
 constant per context, `ctx:`-prefixed (not a path), and `!= _template_name(ctx)`,
 with a hash disjoint from a real-path scope. **Project is now T1–T15 complete
 (the full TASKS.md list).**
+
+### 2026-05-24 — T16: User-declared env (`config.py` + `lifecycle._exec_env`)
+
+**Changed (`config.py` — parse/validate/store, no rootfs touched):**
+- Added `env: Mapping[str, str]` + `forward: tuple[str, ...]` to both `Config`
+  (global) and `Context` (per-context), defaulting empty (`field(default_factory
+  =dict)` / `()`), so every existing `Config(...)`/`Context(...)` construction is
+  unchanged. Imported `collections.abc.Mapping`.
+- Added `_parse_env(raw, where) -> (literals, forward)` + the `_check_env_name`
+  helper. The reserved lowercase key `forward` → `_str_list` (host var names);
+  every other pair is a literal `KEY = "value"`. Validates: env-name shape
+  (`_ENV_NAME_RE`), string values, and rejects `HOME`/`USER`/`PATH` (`_RESERVED_ENV`)
+  in **both** literals and `forward`. Wired into `parse_config` (`data["env"]`,
+  `where="[env]"`) and `_parse_context` (`raw["env"]`).
+- Refreshed `_DEFAULT_CONFIG_TOML` with a commented `[env]` block (one literal +
+  one `forward`) + a per-context `env = { … }` line on the example context.
+
+**Changed (`lifecycle.py` — merge/apply at exec, run-path-only):**
+- `_exec_env` signature `(host_user, home)` → `(cfg, context, host_user, home)`
+  (called once in `run` at the `exec claude`, which already holds `cfg`/`res`).
+  Merge is broadest→narrowest, later-wins: (1) identity `HOME/USER/PATH`;
+  (2) built-in forwarded baseline (`_FORWARD_ENV`/prefixes, **setdefault** so it
+  never clobbers identity); (3) user `forward` = global ∪ context, pulled from
+  `os.environ`, **skipped if unset**; (4) user literals — global, then context
+  overrides global (literals beat forwarded); (5) identity re-asserted last.
+- Call site now passes `_exec_env(cfg, res.context, host_user, home)`.
+
+**Decisions / gotchas:**
+- **`forward` accepts a bare string** (coerced via `_str_list`, like
+  `when`/`include`/`packages`); "must be a list of strings" is read as
+  *elements* must be strings (a non-string element or a non-list/non-string
+  value → `ConfigError`). Consistent with the rest of the loader. User informed,
+  no objection.
+- **Build-id untouched, by construction** — `_base_build_id`/`_template_build_id`
+  never reference `cfg.env`/`ctx.env`, so an env-only edit leaves both ids equal
+  (unit-asserted in `test_exec_env.py`): no instance recreation. **NB for T17:**
+  the *config stamp* (`_config_stamp`) is still the raw-byte hash, so right now an
+  `[env]` edit DOES drift the stamp → one auto-`setup` (harmless, no rebuild
+  churn since base/templates are byte-identical). T17 re-keys the stamp to the
+  build-id and removes even that auto-`setup` (DESIGN §7.3/§10/§15.13). Until T17
+  lands, §15.12's "an env-only edit does **not** change the §4 build-id" holds
+  (verified) but the stamp-skip half is explicitly deferred to §15.13/T17.
+- **No `SCHEMA_VERSION` bump** (still 2): env is run-path-only, the config
+  *shape* parsers tolerate the new optional tables, and env is not in the rootfs.
+- **A `dict` field on a frozen dataclass** makes `Config`/`Context` effectively
+  unhashable — confirmed nothing hashes them (only `scope_hash`/`_config_stamp`,
+  unrelated). Stored as a plain dict via `default_factory` per the design's
+  `Mapping[str,str]`; immutability is by convention (frozen binding), matching
+  how the rest of the model treats its tuples.
+- **`${VAR}` reaches env literals for free** — the T13 pre-pass walks the whole
+  dict (incl. `env`) before parsing; `_parse_env` does **not** `_expand`, so env
+  values are never `~`-expanded (env ≠ path). Verified: `${WM}/bin` with
+  `WM="~/proj"` → `"~/proj/bin"` (tilde survives).
+
+**Verified:** `python3 -m pytest -q` → **173 passed** (150 prior + 23 new: 11
+config-parse in `test_config.py`, 12 in new `test_exec_env.py`). Config tests
+cover literal+forward parse (global, inline-table + `[contexts.env]` sub-table),
+name/value/forward-shape/-element validation, reserved-key rejection (global +
+context), `${VAR}` expansion with no `~` expansion, and empty defaults.
+`test_exec_env.py` covers identity always-set/re-asserted, both mechanisms,
+literal-beats-forwarded, context-beats-global, full precedence, global∪context
+forward union, unset-forward skip, and build-id insensitivity (base + template).
+**Real `exec` (host throwaway `printenv` off `claude-base`, 9/9):** global
+literal, forwarded host var, literal>forwarded (`FOO`), context>global
+(`DEPLOY`), context forward, built-in `TERM`, unset-forward skipped, `HOME`/`USER`
+preserved — all reached the sandbox at exec time. Throwaway deleted; `claude-base`
+untouched. **Project is now T1–T16 complete.** Not exercised: a full interactive
+TUI (printenv proves env passing; T8 already proved claude launches) and the
+`@`-username leg (host is gianz/1000).

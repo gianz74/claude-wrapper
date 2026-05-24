@@ -423,6 +423,112 @@ include = ["creds"]
     assert id_ro != id_rw
 
 
+# --- environment (`[env]` + context `env`, DESIGN §7.3, T16) -----------------
+
+
+def test_env_global_literal_and_forward_parsed(tmp_path):
+    text = """\
+[env]
+EDITOR  = "vim"
+forward = ["GH_TOKEN"]
+"""
+    cfg = load_config(_write(tmp_path, text))
+    assert dict(cfg.env) == {"EDITOR": "vim"}
+    assert cfg.forward == ("GH_TOKEN",)
+
+
+def test_env_per_context_inline_table(tmp_path):
+    text = """\
+[[contexts]]
+name = "c"
+when = ["~/p"]
+env  = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }
+"""
+    ctx = load_config(_write(tmp_path, text)).contexts[0]
+    assert dict(ctx.env) == {"DEPLOY_ENV": "work"}
+    assert ctx.forward == ("WORK_TOKEN",)
+
+
+def test_env_per_context_subtable_form(tmp_path):
+    # The design states the `[contexts.env]` sub-table form is also accepted; it
+    # parses to the same dict as the inline form.
+    text = """\
+[[contexts]]
+name = "c"
+when = ["~/p"]
+  [contexts.env]
+  DEPLOY_ENV = "work"
+"""
+    ctx = load_config(_write(tmp_path, text)).contexts[0]
+    assert dict(ctx.env) == {"DEPLOY_ENV": "work"}
+
+
+def test_env_invalid_name_rejected(tmp_path):
+    text = '[env]\n"bad-name" = "x"\n'
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        load_config(_write(tmp_path, text))
+
+
+def test_env_non_string_value_rejected(tmp_path):
+    text = "[env]\nFOO = 123\n"
+    with pytest.raises(ConfigError, match="expected a string"):
+        load_config(_write(tmp_path, text))
+
+
+def test_env_forward_elements_must_be_strings(tmp_path):
+    text = "[env]\nforward = [1, 2]\n"
+    with pytest.raises(ConfigError, match="expected a string"):
+        load_config(_write(tmp_path, text))
+
+
+def test_env_forward_wrong_type_rejected(tmp_path):
+    text = "[env]\nforward = 5\n"
+    with pytest.raises(ConfigError, match="expected a string or list"):
+        load_config(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize("name", ["HOME", "USER", "PATH"])
+def test_env_reserved_key_rejected(tmp_path, name):
+    text = f'[env]\n{name} = "x"\n'
+    with pytest.raises(ConfigError, match="reserved"):
+        load_config(_write(tmp_path, text))
+
+
+def test_env_reserved_key_rejected_in_context(tmp_path):
+    text = """\
+[[contexts]]
+name = "c"
+when = ["~/p"]
+env  = { PATH = "/x" }
+"""
+    with pytest.raises(ConfigError, match="reserved"):
+        load_config(_write(tmp_path, text))
+
+
+def test_env_var_expansion_in_value_no_tilde(tmp_path):
+    text = """\
+[vars]
+WM = "~/proj"
+
+[env]
+PATH_EXTRA    = "${WM}/bin"
+HOME_LITERAL  = "~/x"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    # ${WM} expands to the var value verbatim ("~/proj"); env values are NOT
+    # ~-expanded (env ≠ path) — both the substituted and literal ~ survive.
+    assert cfg.env["PATH_EXTRA"] == "~/proj/bin"
+    assert cfg.env["HOME_LITERAL"] == "~/x"
+
+
+def test_env_absent_defaults_empty(tmp_path):
+    cfg = load_config(_write(tmp_path, SAMPLE))
+    assert dict(cfg.env) == {}
+    assert cfg.forward == ()
+    assert dict(cfg.contexts[0].env) == {}
+    assert cfg.contexts[0].forward == ()
+
+
 def test_ensure_user_config_writes_defaults(tmp_path):
     d = tmp_path / "cfgdir"
     path = ensure_user_config(d)
