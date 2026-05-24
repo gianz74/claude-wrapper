@@ -167,6 +167,57 @@ surface it rather than guessing.
   left running and reused. Unit-test the pure drift decision (instance build-id
   vs. source build-id → recreate?) with injected tag values.
 
+- [ ] **T13 — `${VAR}` config expansion (`config.py`, DESIGN §7.1).** Add a
+  `[vars]` table + `${NAME}` substitution so per-machine configs stop repeating
+  long path prefixes (TOML has no native interpolation — this is our loader's
+  own pre-pass). Implement as a **single pre-pass over the raw parsed-TOML dict**
+  *before* the existing section parsers run, so those parsers (and their `~`
+  `_expand`) are untouched:
+  - Parse `[vars]` first into a `name → str` map (flat table; values used
+    verbatim — a `${…}` inside a var value is **not** resolved, no recursion).
+  - Recursively walk every other string in the dict and replace `${NAME}`
+    (brace form only — leave bare `$NAME` literal so `$`-paths survive). Names
+    match `[A-Za-z_][A-Za-z0-9_]*`. Undefined `${NAME}` → `ConfigError` naming
+    the key. **Do not** walk the `[vars]` table itself.
+  - Order: `${VAR}` substitution happens before `~` expansion (so `${WM}` may
+    itself start with `~`). Strip `[vars]` from the dict before the section
+    parsers see it. Bump `SCHEMA_VERSION` → 2 (folds into the §10 stamp).
+  **Done when:** a config with `[vars] WM = "~/x"` and `from = "${WM}/.gnupg"`
+  loads with `from_` == `/home/<user>/x/.gnupg`; an undefined `${NOPE}` raises a
+  clear `ConfigError` naming `NOPE`; a literal `$HOME`-style string with no
+  braces is left untouched; existing var-less configs parse identically. Unit
+  tests in `tests/` cover all four.
+
+- [ ] **T14 — Mount groups + context `include` (`config.py`, DESIGN §7.2).**
+  Add reusable named mount bundles so several contexts can share one set of
+  mounts (e.g. credential mounts across `~/work` sub-tree contexts) without
+  duplicating entries or inventing a `when`-bearing parent. Confine the whole
+  change to `parse_config` — flatten at parse time so **nothing downstream
+  changes**:
+  - Parse `[mount_groups.<name>]` (each has a `mounts` array parsed with the
+    existing `_parse_mount`, inline or full tables). Build a `name → tuple[MountSpec]`
+    map. Groups are parse-time-only — **not** stored on `Config`.
+  - Add an optional `include` to a context (`_str_list`, single string ok).
+    Unknown group name → `ConfigError` naming it (and the context).
+  - **Flatten into `Context.mounts`:** included groups in `include` order, then
+    the context's own inline mounts; **dedupe by container-side `path` with
+    later-wins** (inline overrides included; later group overrides earlier). The
+    resulting `Context.mounts` is the only thing downstream sees — `build_templates`,
+    `_template_build_id` (T12), scope-keying (§5) and masking/guards (§8) need
+    **no change** because they already operate on `Context.mounts`. Verify the
+    build-id picks up the flattened set (so changing a group recreates the
+    instances of every context that includes it).
+  - Refresh `_DEFAULT_CONFIG_TOML` to show `[vars]` + a `[mount_groups]` +
+    `include` example (mirroring DESIGN §7.1/§7.2). `SCHEMA_VERSION` is already
+    at 2 from T13 (bump only if T14 lands first).
+  **Done when:** two contexts each `include = ["creds"]` (a group of three
+  `from`-aliased credential mounts) both resolve to those three mounts plus their
+  own; an inline mount with the same `path` as a group mount **overrides** it
+  (later-wins, asserted on `mode`/`from_`); an unknown `include` name raises a
+  clear `ConfigError`; `_template_build_id` differs when a group's mounts change.
+  Unit tests cover include-order, inline override, unknown-group, and the
+  build-id sensitivity.
+
 ---
 
 ## Progress log
@@ -1012,3 +1063,52 @@ Running, kept its old id) — the T10 liveness guard. `incus list` shows only
 here:** a full real `setup` rebuild + relaunch (the build-id stamping is covered
 by unit tests; the recreation mechanism by the integration run) and the
 `@`-username leg (host is gianz/1000).
+
+### 2026-05-24 — T13 + T14 added (config-DRY design amendment; NOT yet implemented)
+
+**Context:** User wants to shrink a fast-growing `config.toml` (two new
+`~/work` sub-tree contexts sharing the same `.ssh`/`.gnupg`/`.gitconfig`
+credential mounts) along two axes — (1) stop repeating the long
+`~/.config/claude-wrapper/work-mappings/` prefix in every `from`, and
+(2) stop duplicating the three credential mount blocks across contexts.
+
+**Design decisions made this session (with the user) → DESIGN §6 + new §7.1/§7.2:**
+- **TOML has no native interpolation/anchors** (spec deliberately omits them), so
+  Change 1 is our own loader pre-pass: a `[vars]` table + `${NAME}` substitution
+  (brace form only; bare `$NAME` left literal). User chose `${VAR}` (1a) over a
+  narrow `from_base` relative-resolution or `expandvars`-on-real-env. → **T13**.
+- Change 2 → **mount groups (Design B)**, chosen over abstract-context-`+extends`
+  (Design A) and explicitly over "child overrides parent's `when`". Rationale: the
+  shared thing is *a set of mounts*, not a context — a group has **no `when`, no
+  template, no instance** by construction, so it never competes in the §6
+  longest-prefix match (which is exactly the user's stated worry, sidestepped
+  rather than patched with override/tie-break rules). → **T14**.
+- **Conflict rule: inline-overrides-included, later-wins by container-side `path`**
+  (user's call). **Inheritance is mounts-only** (was a Design-A question; moot
+  under B, but recorded).
+- **Both are parse-time-only sugar that flatten into the existing model.** `[vars]`
+  expands into all path strings before `~` expansion; `[mount_groups]`+`include`
+  flatten into `Context.mounts`. Neither appears on the runtime `Config` surface,
+  and **nothing downstream changes** — template build, build-id (T12),
+  scope-keying (§5), masking/guards (§8) all already operate on `Context.mounts`.
+  This keeps the §4 3-tier CoW hierarchy untouched (a CLAUDE.md hard constraint).
+- **`SCHEMA_VERSION` → 2** (T13): the config *shape* changes, and adopting groups
+  changes a template's baked mount set, so the §10 stamp drift forces one
+  re-`setup` (rebuild templates → T12 recreates instances on the new rootfs).
+
+**Implementation notes for the T13/T14 sessions:**
+- T13 recommended shape: parse `[vars]`, then a **recursive pre-pass over the raw
+  TOML dict** substituting `${NAME}` in every string *except* inside `[vars]`
+  itself, strip `[vars]`, then run the existing section parsers unchanged (their
+  `_expand`/`expanduser` still does the `~` step second). Undefined `${NAME}` →
+  `ConfigError` naming the key.
+- T14 confines entirely to `parse_config`: build a `name → tuple[MountSpec]` map
+  from `[mount_groups.*]` (reuse `_parse_mount`), add optional context `include`
+  (`_str_list`), flatten included-then-inline into `Context.mounts` with
+  later-wins dedupe by `path`. Refresh `_DEFAULT_CONFIG_TOML` with a worked
+  `[vars]`+group+`include` example. Don't store groups on `Config`.
+- Ordering: T13 before T14 so the §7.2 group example's `${WM}` already works, but
+  they're independent — if T14 lands first, it bumps `SCHEMA_VERSION` instead.
+
+**Verified:** none — design + task draft only. No code changed; `DESIGN.md`
+(§6 bullet + §7.1/§7.2) and `TASKS.md` (T13, T14, this log entry) only.

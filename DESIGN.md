@@ -98,6 +98,10 @@ container exposes that contains the cwd:
   config order (or a setup-time error).
 - No implicit default: unmatched cwd → `default` context off `claude-base`
   (no ssh/gnupg). A catch-all `when = ["~"]` context can be added.
+- A context's effective mounts are resolved at config-load time from its
+  `include`d **mount groups** plus its own `[[contexts.mounts]]` (§7.2); mount
+  groups are not contexts — they have no `when` and never participate in this
+  resolution.
 
 ## 7. Config — `~/.config/claude-wrapper/config.toml`
 
@@ -147,6 +151,84 @@ provision_script = "~/.config/claude-wrapper/provision-api.sh"   # optional; run
 - **`name` is required**, container is `claude-sandbox-<name>`; duplicate names →
   setup error.
 - Mode: `path`-only = parity; `path`+`from` = alias. Credentials default `ro`.
+
+### 7.1 Variable expansion (`[vars]`)
+
+TOML has **no native interpolation, references, or anchors/aliases** — these were
+deliberately left out of the spec. So the wrapper supplies a small substitution
+pass of its own, purely to keep per-machine configs DRY:
+
+```toml
+[vars]
+WM = "~/.config/claude-wrapper/work-mappings"
+
+  [[contexts.mounts]]
+  path = "~/.gnupg"
+  from = "${WM}/.gnupg"
+```
+
+- `[vars]` is a flat table of `name → string`. `${NAME}` (**brace form only** —
+  a bare `$NAME` is left literal, so paths containing `$` are safe) is
+  substituted into **every** other string value in the config (`path`, `from`,
+  `provision_script`, `when`, package names, group mounts), as a verbatim
+  pre-pass run **before** `~` expansion. Names match `[A-Za-z_][A-Za-z0-9_]*`.
+- **Single level, no recursion:** a `${…}` appearing inside a `[vars]` value is
+  *not* itself expanded — vars cannot reference vars. Predictable, no cycles.
+- An undefined `${NAME}` is a `ConfigError` naming the key (never silently
+  passed through).
+- `[vars]` is consumed at parse time only; it has no runtime effect and is not
+  part of the `Config` model.
+
+### 7.2 Mount groups (`[mount_groups]` + context `include`)
+
+A **mount group** is a reusable, named bundle of mounts spliced into one or more
+contexts. It is **not a context**: no `name`-derived container, no `when`, no
+template, no instance, never matched by resolution (§6) — it exists only to be
+`include`d. This shares a set of mounts across contexts (e.g. one credential
+bundle for several `~/work` sub-trees) without duplicating the entries or
+giving the shared thing a `when` that would compete in prefix resolution.
+
+```toml
+[mount_groups.acme-creds]
+mounts = [
+  { path = "~/.ssh",       from = "${WM}/.ssh" },
+  { path = "~/.gnupg",     from = "${WM}/.gnupg" },
+  { path = "~/.gitconfig", from = "${WM}/.gitconfig" },
+]
+
+[[contexts]]
+name    = "api"
+when    = ["~/work/acme-api"]
+include = ["acme-creds"]                 # list, or a bare string for one group
+  [[contexts.mounts]]
+  path = "~/work/acme-api"
+  [[contexts.mounts]]
+  path = "~/work/acme-cli"
+
+[[contexts]]
+name    = "web"
+when    = ["~/work/acme-web"]
+include = ["acme-creds"]
+# no own mounts → cwd-only (per-cwd project mount via §5) + the shared creds
+```
+
+- Each entry under `mounts` is parsed **exactly like** a `[[contexts.mounts]]` /
+  `[[mounts]]` table (same `path`/`from`/`mode`/`exclude`); inline tables or full
+  tables both work.
+- A context's `include` is a list of group names (a bare string is accepted for
+  one). An unknown group name → `ConfigError`.
+- **Flattening (at parse time):** a context's *effective* mounts = each included
+  group's mounts in `include` order, **then** the context's own inline
+  `[[contexts.mounts]]`. **Later wins on a container-side `path` collision** — an
+  inline mount overrides an included one with the same `path`; among groups, a
+  later-listed group overrides an earlier one. The merged list lands in
+  `Context.mounts`, so **everything downstream is unchanged** (template build,
+  build-id §4, scope-keying §5, masking/guards §8): none of it ever sees groups,
+  only the flattened mount list.
+- Like `[vars]`, `[mount_groups]` is parse-time-only — not part of the runtime
+  `Config` surface. Adopting it changes a context template's baked mount set, so
+  the `SCHEMA_VERSION` bump (folded into the §10 stamp) forces one re-`setup`,
+  which rebuilds templates and — via T12 — recreates instances on the new rootfs.
 
 ## 8. Mount selection, masking, exclusions, refuse-guard
 
