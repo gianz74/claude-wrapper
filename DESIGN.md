@@ -250,9 +250,10 @@ hints, the `ANTHROPIC_`/`CLAUDE_`/`AWS_` prefixes — §12), a user can declare
 extra env in config. **Env is a run-path concern only:** it is applied at
 `exec claude` time, *never* baked into `claude-base`/templates. So it touches no
 rootfs, is **not** part of the §4 build-id, needs **no** `SCHEMA_VERSION` bump,
-and must **not** trigger instance recreation. (Editing `config.toml` still trips
-the §10 byte-hash stamp → one auto-`setup`; that is the generic config-edit cost,
-not an env rebuild — accepted, not special-cased.)
+and must **not** trigger instance recreation. Per the build-relevant stamp (§10),
+an env-only edit triggers **no** auto-`setup` either — the run path just reads the
+new env at the next `exec`. (Implemented by T17; before that the byte-hash stamp
+forced one harmless rebuild on any edit.)
 
 ```toml
 [env]
@@ -339,9 +340,17 @@ env  = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }  # [contexts.env] sub-t
 
 ## 10. Lifecycle
 
-- **Stamp:** local file holding `hash(schema_version + config.toml)`. A normal
-  run compares it (a cheap local hash, no daemon calls); **mismatch → auto-run
-  `setup`** (so editing config re-provisions on next launch). Match → fast path.
+- **Stamp:** local file holding a hash of the *build-relevant* config — the base
+  build-id (§4: schema, global packages, provision-script **content**, global
+  mounts) plus every context template's build-id. A normal run recomputes it from
+  the loaded config (cheap local hashing + reading the small provision scripts —
+  **no daemon calls**) and compares; **mismatch → auto-run `setup`**. Match → fast
+  path. Keying on **build identity** (not raw `config.toml` bytes) is deliberate:
+  a *runtime-only* edit (`[env]` §7.3, a `[reaper]` threshold) does **not** force a
+  rebuild, while a provision-script *content* edit (which leaves `config.toml`
+  byte-identical) now correctly does. The auto-`setup` decision and the §4
+  instance-recreation decision thus share one definition of "build-relevant" and
+  can never disagree.
 - **Normal run:** resolve context → compute scope → instance name → ensure it
   exists (CoW from template if missing) and is running (`start` if stopped) →
   bump `user.last-used` → ensure project mount (only if not subsumed; persistent,
@@ -492,8 +501,14 @@ The rewrite is "done" when each of these passes:
     on a key collision; a literal overrides a same-named forwarded var; a `forward`
     name unset on the host is skipped; setting a reserved `HOME`/`USER`/`PATH` in
     `[env]` is rejected by config load; an env-only config edit does **not** change
-    the §4 build-id (no instance recreation) — only the generic one-shot
-    auto-`setup` from the stamp.
+    the §4 build-id (so no instance recreation; whether it also skips auto-`setup`
+    is covered by §15.13/T17).
+13. **Build-relevant stamp (§10):** a *runtime-only* `config.toml` edit (an `[env]`
+    value, a `[reaper]` threshold) triggers **no** auto-`setup` and no instance
+    recreation on the next run (stamp unchanged); a *build-relevant* edit — a
+    `[setup].packages` entry, a mount, **or a provision-script's content with
+    `config.toml` byte-identical** — triggers exactly one auto-`setup`. No daemon
+    calls are added to the warm path versus §15.2.
 
 ## 16. Open / deferred
 

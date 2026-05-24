@@ -308,6 +308,56 @@ surface it rather than guessing.
   skip, and build-id insensitivity. Verify the merged env on a real `exec claude`
   (a throwaway `printenv` is enough — no full TUI).
 
+- [ ] **T17 — Build-relevant config stamp (`lifecycle._config_stamp`, DESIGN §10).**
+  Stop runtime-only config edits from forcing a full rebuild, and start catching
+  provision-script content edits that are currently silently ignored, by keying
+  the auto-`setup` stamp on the config's **build identity** instead of raw
+  `config.toml` bytes. Independent of T16 (whichever lands second reconciles the
+  shared §7.3 wording). Confine to `lifecycle.py`:
+  - **Re-key the stamp.** Today `_config_stamp(config_path)` (`lifecycle.py:776`)
+    is `md5(SCHEMA_VERSION + config.toml bytes)`. Change it to a hash over the
+    build identities the config produces: `base_id = _base_build_id(cfg)`
+    (`:388`) plus `_template_build_id(base_id, ctx)` (`:410`) for every
+    `ctx in cfg.contexts`, sorted for stability. **Signature change** to
+    `_config_stamp(cfg: Config) -> str` — both callers already hold `cfg` (`run`
+    at `:975`, `setup` at `:745`). `SCHEMA_VERSION` stays covered because
+    `_base_build_id` already folds it in (`:400`), so drop the separate prepend.
+  - **Why this is the whole fix (no new partition to maintain).** The build-ids
+    already define "what touches the rootfs" (schema, global packages,
+    provision-script **content**, global mounts, per-context name/provision/mounts).
+    Anything *not* in them is runtime-only — `[env]` (T16), `[reaper]` thresholds —
+    and so will not drift the stamp. `[vars]`/`[mount_groups]` are already flattened
+    into mounts/paths before the build-id sees them, so a `${VAR}` used in a mount
+    still drifts (correct) while one used only in an `[env]` literal does not.
+  - **Two payoffs, one change.** (a) runtime-only edits no longer rebuild;
+    (b) editing a `provision.sh` with `config.toml` byte-identical now drifts the
+    stamp (the build-id reads `_read_provision` content) — currently that edit is
+    **inert until a manual `setup`** (a footgun). Adding/removing/renaming a
+    context still drifts (the set of template build-ids changes), so auto-`setup`
+    builds/prunes as today.
+  - **Hot-path cost.** The only new work is local file reads (the provision
+    scripts) — **no daemon calls** — so the §15.2 budget is untouched. Re-measure
+    the warm path with the existing harness to confirm 3 calls / 2-before-claude.
+  - **Single source of truth.** After this, the auto-`setup` decision and the T12
+    instance-recreation decision are both answered by the same build-id functions
+    and can't disagree — note this in the `_config_stamp` docstring/comment.
+  - **No `SCHEMA_VERSION` bump** (local-stamp logic; templates/config shape
+    unchanged). On-disk stamps written by the old byte-hash scheme simply mismatch
+    once → one harmless auto-`setup` on the first run after upgrade, then stable.
+    Note in the progress log. DESIGN §10's stamp bullet, §7.3's env caveat, and
+    §15.13 are already amended (this task's design commit); reconcile T16's note if
+    T16 is still open.
+  **Done when:** §15.13 passes — a `[reaper]`/`[env]` edit triggers no
+  auto-`setup` and no recreation (stamp unchanged across the edit); a
+  `[setup].packages`/mount edit, **and** a provision-script content edit with
+  `config.toml` unchanged, each trigger exactly one auto-`setup`; the warm-path
+  daemon-call budget matches §15.2. Unit tests (pure, no daemon): `_config_stamp`
+  is **stable** across a runtime-only mutation (two `Config`s differing only in
+  `env`/`reaper` → equal stamp), **drifts** on each build-relevant mutation
+  (packages, a mount field, ctx add/remove), and **drifts on provision-content
+  change** (point `provision_script` at a temp file, rewrite its bytes → different
+  stamp with the same `Config` shape).
+
 ---
 
 ## Progress log
