@@ -172,6 +172,12 @@ provision_script = "~/.config/claude-wrapper/provision-api.sh"   # optional; run
   alias dirs above, and system roots (`/ /etc /usr /bin /boot /dev /proc /sys
   /run /var`). Out-of-home project dirs are permitted — the per-cwd isolation
   earns this flexibility.
+- **claude-shadow guard (setup-time):** `setup` refuses if any configured mount's
+  container-side `path` covers the in-container claude — i.e. is at or above
+  `~/.local/share/claude` (the binary) or `/usr/local/lib/claude-wrapper/bin`
+  (the private launcher, §11). Such a mount would replace the container's own
+  claude with host content and silently break `exec claude`. Mounting
+  `~/.local/bin` alone is fine — the launcher lives outside it.
 
 ## 9. CLI surface
 
@@ -215,13 +221,30 @@ provision_script = "~/.config/claude-wrapper/provision-api.sh"   # optional; run
 ## 11. Provisioning
 
 - Internal (mechanism, in the package): claude install + install-method
-  detection, identity rename, idmap, `raw.apparmor`, DNS-wait.
+  detection, a **container-private claude launcher symlink** (below), identity
+  rename, idmap, `raw.apparmor`, DNS-wait.
 - External (your policy, in config dir): `[setup].packages` (wrapper runs
   `apt-get install -y …`) + optional `[setup].provision_script` (run on
   `claude-base`, as root, `set -e`, output streamed, setup fails loudly on
   error) + optional per-context `provision_script` (run on that template — the
   template is transiently started for this during `setup` only, then stopped;
   see §4). Re-run on every `setup` (which rebuilds base/templates).
+- **Container-private claude launcher (survives `~/.local/bin` being a mount).**
+  The native installer puts the in-container claude at `~/.local/bin/claude`. A
+  user may mount the host `~/.local/bin` into the container (global `[[mounts]]`);
+  that bind mount would shadow the container's own `~/.local/bin/claude` with the
+  host shim and break `exec claude` (the run path execs **bare `claude`** via the
+  exec PATH). So `build_base`, **right after the claude install and before
+  attaching the global mounts**, resolves the freshly-installed binary
+  (`readlink -f ~/.local/bin/claude` → `~/.local/share/claude/versions/<v>`, a
+  single self-contained ELF) and creates a launcher symlink in a directory
+  **outside `$HOME`** — `/usr/local/lib/claude-wrapper/bin/claude` — which the
+  exec PATH **prepends ahead of `~/.local/bin`** (§12). At run time the mounted
+  host `~/.local/bin` is then shadowed and inert; bare `claude` resolves to the
+  private launcher → the container's own binary (kept private as long as
+  `~/.local/share/claude` itself is not mounted — see the §8 claude-shadow guard).
+  Auto-update is off (`autoUpdates:false`, mirrored from the host `~/.claude.json`
+  mount), so claude is refreshed only by `setup`, consistent with the frozen base.
 
 ## 12. Preserved fixes (ported, parameterized by the selected instance)
 
@@ -235,19 +258,41 @@ provision_script = "~/.config/claude-wrapper/provision-api.sh"   # optional; run
 | IDE lockfile **pid** patch + uid-1000 **sentinel** process | sentinel in selected instance |
 | IDE lockfile **trailing-slash** normalization (Emacs `default-directory`) | kept — independent of home-parity |
 | `~/.local/bin` PATH prepend, install-method detect, packages | `setup` (base) |
+| Container-private claude launcher (`/usr/local/lib/claude-wrapper/bin`) + PATH prepend — survives `~/.local/bin` being a mount (§11) | `setup` (base) → exec PATH |
 
 `claude-code-ide` is the live integration (passes inline `--mcp-config '{…}'` +
 `CLAUDE_CODE_SSE_PORT`, cwd = project root). All bridging targets the
 context-selected per-cwd instance.
 
-## 13. Packaging
+## 13. Packaging & host install
 
-- A real Python package (`claude_wrapper/`), installed with **pipx**, exposing a
-  `claude-wrapper` entry point you symlink to `claude`.
+- A real Python package (`claude_wrapper/`), installed with **pipx** (`pipx
+  install -e .` during development), exposing a `claude-wrapper` console entry
+  point at `~/.local/bin/claude-wrapper`.
+- **`claude` invokes the sandbox.** The user types `claude`, not
+  `claude-wrapper`, for the run path. Realised as a **`claude` symlink to the
+  wrapper placed anywhere on `$PATH` *ahead of* the real claude binary**
+  (`~/.local/bin/claude` → `~/.local/share/claude/versions/<v>`). The package
+  does **not** dictate the directory — any dir the user controls and orders
+  before `~/.local/bin` works (`~/bin` is one natural choice; avoid
+  `~/.local/bin/claude` itself, which the native installer owns and may clobber).
+  What matters is the *outcome*: `claude` resolves to the wrapper. Management
+  subcommands are still run as `claude-wrapper setup|delete|gc`; bootstrap works
+  before any shim exists because pipx already puts `claude-wrapper` on `PATH`.
+- **Detect-and-instruct, never mutate** — the `_check_subuid` idiom (§3). The
+  package never creates the shim, edits a shell rc, or deletes legacy files.
+  `setup` **resolves `claude` against the user's `$PATH`** (first-match lookup):
+  if it already lands on the wrapper, nothing to do; otherwise it **prints
+  suggested commands** (a symlink to `~/.local/bin/claude-wrapper` in a PATH dir
+  of the user's choosing, ahead of the real binary) and flags any leftover
+  `~/.local/bin/claude-wrapper.py`/`.sh` for removal. The user decides where and
+  runs them. See §11 for the in-container half (why `~/.local/bin` being a mount
+  doesn't break `exec claude`), §8 for the claude-shadow guard, and §15.11 for
+  the criterion.
 - Module layout: `cli.py` (dispatch/arg-parse), `config.py` (tomllib load +
   validate), `incus.py` (cli_run helpers), `lifecycle.py` (tiers, CoW, stamp,
-  reaper), `mounts.py` (scope-keying, masking, refuse-guard), `mcp.py`
-  (staging/proxy/sentinel/lockfile), `provision.py` (packages + scripts).
+  reaper, host-install checks), `mounts.py` (scope-keying, masking, refuse-guard),
+  `mcp.py` (staging/proxy/sentinel/lockfile), `provision.py` (packages + scripts).
 
 ## 14. One-time cleanup (do before first `setup`)
 
@@ -292,6 +337,13 @@ The rewrite is "done" when each of these passes:
     `stop_idle_after` and deletes after `delete_unused_after`; `delete <name>`
     removes one context, `delete` removes all; `setup` re-syncs all from base and
     prunes a removed context.
+11. **Host install / claude-shadow (§13/§11/§8):** with `~/.local/bin` configured
+    as a global mount, a launch still execs the *container's own* claude (the
+    private launcher wins over the shadowed `~/.local/bin`); a config that mounts
+    `~/.local/share/claude` (or `~`) is refused by `setup` with a clear message;
+    and on a host where `claude` does not resolve to the wrapper (no shim, or it
+    sits behind the real binary on `$PATH`), `setup` prints suggested fix commands
+    (and flags a leftover `~/.local/bin/claude-wrapper.py`/`.sh`).
 
 ## 16. Open / deferred
 

@@ -96,6 +96,42 @@ surface it rather than guessing.
   subcommand, `delete [name]` (one context vs all, `[y/N]`). **Done when:**
   §15.10 passes.
 
+- [ ] **T11 — Host install shim + claude-discovery guard (`lifecycle.py`,
+  setup-side).** Make `claude` (not `claude-wrapper`) the run-path command and
+  make the in-container claude survive `~/.local/bin` being a global mount
+  (DESIGN §13/§11/§12/§8). Two halves:
+  - **In-container (mechanism):** in `build_base`, between `_install_claude`
+    (`lifecycle.py:335`) and `_add_mount_devices` (`:340`) — while
+    `~/.local/bin/claude` is still the container's own symlink — resolve the
+    installed binary for the **native** method (`readlink -f ~/.local/bin/claude`
+    → `~/.local/share/claude/versions/<v>`) and create
+    `/usr/local/lib/claude-wrapper/bin/claude` → that binary; then prepend
+    `/usr/local/lib/claude-wrapper/bin` to the exec PATH in `_exec_env`
+    (`:585`), ahead of `~/.local/bin`. (Non-native install at `/usr/bin/claude`
+    is not under a mount, so it needs no launcher; the prepend is harmless.) Bare
+    `["claude", …]` exec stays.
+  - **Host checks (detect → print → refuse, never mutate; the `_check_subuid`
+    idiom):** add a setup-side host-readiness check that (a) **hard-refuses** if
+    any configured mount's container `path` is at/above `~/.local/share/claude`
+    or the private launcher dir (the §8 claude-shadow guard); and (b) **resolves
+    `claude` against the user's `$PATH`** (replicate the shell's first-match
+    lookup) and, if the winner is not the wrapper
+    (`~/.local/bin/claude-wrapper`), **prints suggested commands** — a `claude`
+    symlink to the wrapper in a PATH dir of the user's choosing, ordered ahead of
+    the real binary (do **not** mandate `~/bin` or any specific dir) — plus a flag
+    for any leftover `~/.local/bin/claude-wrapper.py`/`.sh` to remove. All checks
+    live in `setup` only (the run path inherits the shadow-refuse via stamp-drift
+    auto-setup). The package never creates the shim, edits the rc, or rm's legacy
+    files.
+  **Done when:** §15.11 passes — with `~/.local/bin` as a global mount, a launch
+  execs the container's own claude (verify via a CoW throwaway: the private
+  launcher resolves over the shadowed `~/.local/bin`); a config mounting
+  `~/.local/share/claude` is refused by `setup` with a clear message; and on a
+  host where `claude` doesn't resolve to the wrapper, `setup` prints suggested
+  commands. Unit-test the pure pieces (shadow-guard path logic reusing
+  `mounts._is_within`; the `claude`-resolves-to-wrapper `$PATH` check given an
+  injected `$PATH` + filesystem facts).
+
 ---
 
 ## Progress log
@@ -700,3 +736,61 @@ fresh / true when stale. All throwaways cleaned up; `incus list` shows only
 during a real interactive session (the gate + `reap()` it would call are both
 verified; the `Popen` is trivial) and a wall-clock-aged reap (last-used is
 seeded directly, which is equivalent).
+
+### 2026-05-24 — T11 added (design amendment; NOT yet implemented)
+
+**Context:** Grill on "make the installed `claude-wrapper` executable replace the
+legacy `~/.local/bin/claude-wrapper.py`." Outcome is **design only** — folded into
+DESIGN §13 (rewritten "Packaging & host install"), §11 (container-private claude
+launcher), §12 (table row), §8 (claude-shadow guard), §15.11 (new criterion) —
+and a new **T11** task above. No code changed.
+
+**Findings / decisions (so the T11 session has full context):**
+- **The `claude-wrapper` entry point already exists** — pipx materialised it from
+  `[project.scripts]` in T1 (`~/.local/bin/claude-wrapper` → pipx venv). So "is it
+  possible" was already done; the real work is the *replacement* + host wiring.
+- **Invocation = `claude`** (not `claude-wrapper`) for the run path, via a
+  `claude` symlink to the wrapper. **User declined a mandated location:** the
+  package must not force `~/bin` — it only requires the *outcome* that `claude`
+  resolves to the wrapper, ahead of the real binary, in whatever PATH dir the
+  user picks. So the setup check is **PATH-resolution-based** (replicate the
+  shell's first-match lookup; is the winner the wrapper?), not a `~/bin/claude`
+  file check. (Avoid repointing `~/.local/bin/claude` — the native installer owns
+  it and may clobber.) The printed guidance suggests a symlink + PATH ordering
+  but leaves the directory to the user.
+- **The real run-path gap the user surfaced:** `run` execs **bare `["claude"]`**
+  (`lifecycle.py:707`) and `_exec_env` prepends `$HOME/.local/bin` (`:585`), where
+  the native install lives. The user intends to **mount host `~/.local/bin` into
+  the container** once they customise config; that bind mount shadows the
+  container's own claude, so bare `claude` would resolve to the host shim →
+  recursion/breakage. Fix (T11): a container-private launcher at
+  `/usr/local/lib/claude-wrapper/bin/claude` (**outside `$HOME`**, so no home
+  mount can shadow the dir), created in `build_base` between install (`:335`) and
+  mount-attach (`:340`), prepended to the exec PATH. Native install + bare-name
+  exec are otherwise unchanged.
+- **Derisking facts (verified during the grill):** the native claude is a single
+  self-contained ELF at `~/.local/share/claude/versions/<v>` (launcher points
+  straight at it; no support files), and host `~/.claude.json` has
+  **`autoUpdates:false` + `autoUpdatesProtectedForNative:true`** — mirrored into
+  the container via the existing `~/.claude.json` global mount — so no
+  in-container self-update will try to rewrite `~/.local/bin/claude` *through* the
+  host mount. Claude is refreshed only by `setup` (fits the frozen base).
+- **Mechanism = detect → print → refuse, never mutate** (the `_check_subuid`
+  idiom, §3). Package never creates the shim / edits the rc / deletes legacy. **All
+  host checks live in `setup` only** (user choice); the run path inherits the
+  shadow-refuse because editing config drifts the stamp → auto-setup → refuse.
+- **Two severities:** hard-refuse a mount covering `~/.local/share/claude` or the
+  launcher dir (silent breakage); advisory-print when `claude` doesn't resolve to
+  the wrapper, plus a note about leftover legacy `.py`/`.sh`.
+- **Private launcher location** chosen **outside `$HOME`** over the user's
+  original `~/.<hash>` idea — categorically immune to home mounts shadowing the
+  *dir*; the symlink *target* under `~/.local/share/claude` still needs the §8
+  guard regardless. Implementer may adjust the exact path if there's a reason.
+- **Legacy on host (for the migration the printed guidance covers):** `claude` →
+  real binary `versions/2.1.150`; `claude-wrapper.py` (27 KB) + `claude-wrapper.sh`
+  (older) still in `~/.local/bin`; no shell alias redirects `claude`. The legacy
+  `.py` header used `ln -s … ~/bin/claude` as *one* example shim location — T11
+  suggests but does not mandate any particular dir.
+
+**Verified:** none (no code). DESIGN + TASKS edits only; implement T11 in a clean
+context per the workflow.
