@@ -132,7 +132,7 @@ surface it rather than guessing.
   `mounts._is_within`; the `claude`-resolves-to-wrapper `$PATH` check given an
   injected `$PATH` + filesystem facts).
 
-- [ ] **T12 — Recreate stale instances on source rebuild (`lifecycle.py`).**
+- [x] **T12 — Recreate stale instances on source rebuild (`lifecycle.py`).**
   Close the gap where `setup` rebuilds tiers 1–2 but leaves existing tier-3
   instances on the old rootfs, so a `[setup].packages` (or `provision_script` /
   context-mount) change never reaches an already-created per-cwd instance until
@@ -930,3 +930,85 @@ vs. content hash); the liveness-guard interaction (don't yank a live session).
 May warrant a short design amendment (§4/§9/§10) before coding, à la T11.
 
 **Verified:** none (investigation + task draft only; no code/DESIGN changed).
+
+### 2026-05-24 — T12: Recreate stale instances on source rebuild
+
+**Design calls made this session (the two open ones from the draft):**
+- **Lazy recreation** in `_ensure_instance` (not eager delete in `setup`/`reap`).
+  Only instances you actually launch are rebuilt; the §15.2 hot-path budget is
+  untouched on the common non-drifted case (a single `list_instances` substitutes
+  for the per-instance `instance_info` query — still 1 daemon call).
+- **`user.cw-build` = content hash of rootfs inputs** (user-chosen via
+  AskUserQuestion, over epoch / config-file-hash). `_base_build_id(cfg)` hashes
+  global packages + global-provision *content* + global mounts; `_template_build_id(base_id, ctx)`
+  folds in base_id (a base rebuild cascades to all templates/instances) + the
+  context's mounts + provision content (so editing one context recreates only
+  *its* instances). claude's own version is intentionally **not** an input (frozen
+  base model, §11) → a no-op `setup` doesn't churn instances.
+
+**Changed (`lifecycle.py`):**
+- Added `BUILD_KEY = "user.cw-build"`; `_read_provision`, `_mount_inputs`,
+  `_base_build_id`, `_template_build_id`, and the pure `_instance_is_stale`.
+- `build_base` takes `build_id=` and stamps `claude-base` after the mounts,
+  before stop. `build_templates`/`_build_template` take `base_id` and stamp each
+  template with `_template_build_id` (overwriting the id inherited from base via
+  the CoW). `setup` computes `base_id = _base_build_id(cfg)` once and threads it
+  through both.
+- `_ensure_instance` now reads instance + source tags from **one
+  `list_instances()`** call (instead of `instance_info(instance)`), and before
+  reusing an existing instance compares its inherited `cw-build` to the source's
+  *current* one: stale + not-live → delete + fall to the cold CoW path; stale +
+  **live `claude` session** (`_has_live_session`, T10 guard) → warn + reuse this
+  run (recreates next idle run); current → unchanged warm path.
+- `tests/test_lifecycle_build_id.py`: 15 unit tests (the drift decision incl.
+  the None-source/pre-T12-instance cases; build-id determinism + sensitivity to
+  packages/mounts/mode/provision-content; template base-id cascade + per-context
+  isolation).
+
+**Decisions / gotchas for the future:**
+- **CRITICAL — why read the source's *stamped* tag, never recompute on the run
+  path:** a provision-script *content* edit changes the content hash but does
+  **not** drift the config stamp (`_config_stamp` hashes config.toml only), so it
+  triggers no auto-setup. If the warm path recomputed the hash locally it would
+  flag every run as stale → **infinite recreation**. Reading what `setup`
+  actually stamped means the tag changes only when `setup` rebuilds the source.
+  Corollary: a provision.sh content change still needs a **manual `setup`** to
+  take effect (same as the pre-existing T8 stamp limitation — config.toml is the
+  only auto-setup trigger); after that setup, instances recreate and pick it up.
+- **§15.2 budget preserved — RE-MEASURED.** Warm, non-drifted, running instance:
+  `_ensure_instance` makes **exactly 1 daemon call** (the `list_instances`
+  `query`); the run path is then still `query` + `config_set`(last-used) +
+  `exec` = 3 total, 2 before claude. `_has_live_session` (an extra `exec`) fires
+  **only** on the rare stale-and-running path, never on the hot path.
+- **Migration of pre-T12 sources/instances is automatic + safe.** `claude-base` +
+  templates built before T12 carry no `cw-build`; `_instance_is_stale(inst, None)`
+  returns False (unknown source → never recreate), so nothing churns until the
+  next `setup` stamps the sources. A pre-T12 *instance* (no tag) against a
+  freshly-stamped source reads as stale → recreates once. (The user already
+  deleted their stale instances in the 2026-05-24 remediation, so there are none
+  to migrate right now; their next `setup` stamps base + `personal`/`api`.)
+- **`list_instances` (recursion=1) payload is heavier than a single-instance
+  `query`** but it's still one call and returns the `status` + `config` tags the
+  warm path needs (already relied on by T5 prune / T10 reaper). The instance's
+  local `devices` (the only thing the old `instance_info` had that the list view
+  arguably differs on) are unused by `_ensure_instance` — session/project mounts
+  go through `device_show`'s own cached call.
+- Project is now **T1–T12 complete.** DESIGN unchanged this session — the build
+  identity + recreation slot cleanly into the existing §4/§9/§10 model (no
+  amendment needed, unlike T11).
+
+**Verified:** `pytest -q` → **137 passed** (122 prior + 15 new). Throwaway
+integration run against the real daemon (a `t12-src` CoW of `claude-base` standing
+in for a rebuilt source; **11/11 checks**; the real base/templates never touched,
+all t12-* cleaned up): **(A)** a stale instance (`oldbuild`) against a source
+mutated + bumped to `newbuild` was **recreated** — the source's new content (a
+pushed marker = the stand-in "new package") is present, the old-instance sentinel
+is **gone** (proving a fresh CoW, not a mutation), and it's Running; **(B)** a
+**current** instance (`newbuild` == source) was **not recreated** (its sentinel
+survived) and warm `_ensure_instance` made **exactly 1 daemon call**; **(C)** a
+**stale + live-`claude`** instance was **reused** (warned, not recreated, still
+Running, kept its old id) — the T10 liveness guard. `incus list` shows only
+`claude-base` + `claude-sandbox-{personal,api}`, all STOPPED. **Not exercised
+here:** a full real `setup` rebuild + relaunch (the build-id stamping is covered
+by unit tests; the recreation mechanism by the integration run) and the
+`@`-username leg (host is gianz/1000).

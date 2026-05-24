@@ -9,6 +9,10 @@ idmap, apparmor, DNS-wait, claude install — and the tier orchestration.
   closing reaper pass (T10).
 * ``build_templates`` (T5), ``run`` + stamp drift (T8).
 * ``reap`` / ``gc`` / ``delete_containers`` + amortized background reap (T10).
+* Source build-identity stamping + stale-instance recreation (T12): each source
+  carries a content hash of its rootfs inputs (:func:`_base_build_id` /
+  :func:`_template_build_id`); :func:`_ensure_instance` recreates an instance
+  CoW'd from a now-rebuilt source.
 """
 
 from __future__ import annotations
@@ -65,6 +69,8 @@ TEMPLATE_PREFIX = "claude-sandbox-"
 ROLE_KEY = "user.cw-role"  # "template" (this tier) | "instance" (tier 3) | unset
 CONTEXT_KEY = "user.cw-context"  # the owning context's name
 LAST_USED_KEY = "user.last-used"  # epoch seconds; bumped each run, read by the reaper (T10)
+BUILD_KEY = "user.cw-build"  # content hash of the source's rootfs inputs; instances
+                             # inherit it via `incus copy` as their built-from marker (T12)
 
 # incus instance names: 2-63 chars, letters/digits/dashes, must not end in a
 # dash (ours always start with "claude-", so the leading-char rule is moot).
@@ -348,6 +354,95 @@ def _add_mount_devices(container: str, mounts: tuple[MountSpec, ...]) -> None:
         print("Skipped absent mount sources:\n  " + "\n  ".join(skipped))
 
 
+# --- source build identity (DESIGN §4/§10, T12) -----------------------------
+#
+# Each source (claude-base, each claude-sandbox-<ctx> template) is stamped with
+# a content hash of the inputs that define its rootfs. A tier-3 instance CoW'd
+# from a source inherits the tag, so the run path can tell whether the instance
+# was built from a *now-rebuilt* source and recreate it — otherwise a
+# [setup].packages / provision_script / context-mount change never reaches an
+# already-created per-cwd instance (the 2026-05-24 missing-`git` bug).
+#
+# The run path reads the tag *as stamped on the source*, never recomputes the
+# hash: a provision-script edit changes the hash but does NOT drift the config
+# stamp (so no auto-setup), so recomputing locally would flag every run as stale
+# and recreate forever. Reading what `setup` actually stamped means the tag only
+# changes when `setup` rebuilds the source — no such loop.
+
+
+def _read_provision(path: str | None) -> str:
+    """Provision-script *contents* (a rootfs input); absent/None/unreadable -> ''."""
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return ""
+
+
+def _mount_inputs(mounts: tuple[MountSpec, ...]) -> list:
+    """Stable, JSON-serialisable view of mount specs for hashing."""
+    return [[m.path, m.from_, m.mode, list(m.exclude)] for m in mounts]
+
+
+def _base_build_id(cfg: Config) -> str:
+    """Content hash of claude-base's rootfs inputs (DESIGN §4/§10/§11).
+
+    Hashes the global packages, the global provision-script *content*, and the
+    global mounts. claude's own version is intentionally *not* an input — it is
+    frozen/pinned by the base model (§11), refreshed only by a full rebuild — so
+    a setup that only re-pulls the same inputs leaves the id unchanged (no churn).
+    """
+    import hashlib
+
+    payload = json.dumps(
+        {
+            "schema": SCHEMA_VERSION,
+            "packages": list(cfg.setup.packages),
+            "provision": _read_provision(cfg.setup.provision_script),
+            "mounts": _mount_inputs(cfg.mounts),
+        },
+        sort_keys=True,
+    )
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _template_build_id(base_id: str, ctx: Context) -> str:
+    """Content hash for a context template (DESIGN §4/§10).
+
+    Folds in *base_id* (so a base rebuild cascades to every template, hence every
+    instance) plus the context's own inputs — mounts + provision-script content —
+    so editing one context recreates only that context's instances, not all.
+    """
+    import hashlib
+
+    payload = json.dumps(
+        {
+            "base": base_id,
+            "name": ctx.name,
+            "provision": _read_provision(ctx.provision_script),
+            "mounts": _mount_inputs(ctx.mounts),
+        },
+        sort_keys=True,
+    )
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _instance_is_stale(instance_build: str | None, source_build: str | None) -> bool:
+    """Pure drift decision: was the instance CoW'd from an older build of its source?
+
+    Compares the instance's inherited ``user.cw-build`` against the source's
+    *current* one (DESIGN §4/§10). ``source_build is None`` (the source predates
+    build-stamping, e.g. a pre-T12 base) reads as 'unknown' -> not stale, so we
+    never recreate on missing source info; the next ``setup`` stamps the source
+    and recreation resumes. A ``None`` instance build against a stamped source is
+    a pre-T12 instance -> stale (recreate to adopt the current rootfs).
+    """
+    if source_build is None:
+        return False
+    return instance_build != source_build
+
+
 # --- tier 1: base build (DESIGN §3/§11/§12) ----------------------------------
 
 
@@ -358,6 +453,7 @@ def build_base(
     host_uid: int,
     host_gid: int,
     home: str,
+    build_id: str,
 ) -> None:
     """Build the frozen tier-1 ``claude-base`` (delete-and-recreate; §4).
 
@@ -396,6 +492,10 @@ def build_base(
     provision.run_provision_script(BASE, cfg.setup.provision_script, label="global")
 
     _add_mount_devices(BASE, cfg.mounts)
+
+    # Stamp the build identity so instances CoW'd from this base inherit it and
+    # the run path can recreate them when a later setup rebuilds base (§4/§10).
+    incus.config_set(BASE, BUILD_KEY, build_id)
 
     print(f"Stopping {BASE} (frozen CoW source; never run again)...")
     incus.stop(BASE)
@@ -441,7 +541,7 @@ def _provision_template(name: str, ctx: Context) -> None:
         incus.stop(name)
 
 
-def _build_template(ctx: Context) -> None:
+def _build_template(ctx: Context, base_id: str) -> None:
     """Build one tier-2 template by CoW of base + context mounts + provision.
 
     Delete-and-recopy (templates hold no unique state). A template that is
@@ -460,6 +560,9 @@ def _build_template(ctx: Context) -> None:
     incus.copy(BASE, name)  # inherits idmap/apparmor/global mounts; stays STOPPED
     incus.config_set(name, ROLE_KEY, "template")
     incus.config_set(name, CONTEXT_KEY, ctx.name)
+    # Overwrite the build id inherited from base with this template's own (folds
+    # in base_id + the context's inputs), so its instances recreate on drift (§4/§10).
+    incus.config_set(name, BUILD_KEY, _template_build_id(base_id, ctx))
     _add_mount_devices(name, ctx.mounts)  # exclude-masking is T7
     if ctx.provision_script:
         _provision_template(name, ctx)
@@ -488,18 +591,19 @@ def _prune_templates(configured: set[str]) -> None:
         incus.delete(name)
 
 
-def build_templates(cfg: Config) -> None:
+def build_templates(cfg: Config, base_id: str) -> None:
     """Build/refresh every configured context's tier-2 template; prune the rest.
 
     Requires ``claude-base`` to exist (built first by :func:`build_base`).
     Templates inherit identity/idmap/apparmor/global mounts from base via the
-    CoW copy, so no identity arguments are needed here.
+    CoW copy, so no identity arguments are needed here. *base_id* is base's
+    current build identity, folded into each template's id (§4/§10).
     """
     for ctx in cfg.contexts:
         _check_template_name(ctx.name)
     _prune_templates({c.name for c in cfg.contexts})
     for ctx in cfg.contexts:
-        _build_template(ctx)
+        _build_template(ctx, base_id)
 
 
 # --- host-install checks (DESIGN §13/§11/§8) ---------------------------------
@@ -632,8 +736,12 @@ def setup(cfg: Config | None = None) -> int:
     # §8 claude-shadow guard: refuse before any build work (the run path inherits
     # this refusal via stamp-drift auto-setup, so it lives in setup only).
     _check_no_claude_shadow(cfg, home)
-    build_base(cfg, host_user=host_user, host_uid=host_uid, host_gid=host_gid, home=home)
-    build_templates(cfg)
+    base_id = _base_build_id(cfg)  # stamped on base + folded into each template (§4/§10)
+    build_base(
+        cfg, host_user=host_user, host_uid=host_uid, host_gid=host_gid,
+        home=home, build_id=base_id,
+    )
+    build_templates(cfg, base_id)
     _write_stamp(_config_stamp(config_path))
     result = reap(cfg)
     _write_reap_stamp(int(time.time()))
@@ -796,16 +904,44 @@ def _ensure_instance(
     scope: str,
     add_project_mount: bool,
 ) -> None:
-    """Ensure tier-3 *instance* exists (CoW of *source*) and is running (§4/§10).
+    """Ensure tier-3 *instance* exists (CoW of *source*), is current, and running.
 
-    Cold path (missing): CoW-copy from the context template (or ``claude-base``
-    for the *default* context), tag its tier, add the per-cwd project mount
-    unless the cwd is subsumed by a context mount, start, and wait for the agent
-    + DNS. Warm path: start it if stopped. Either way it is left running.
+    One ``list_instances`` call yields both the instance and its source, so the
+    warm path stays within the §15.2 budget (it substitutes for the per-instance
+    ``instance_info`` query — still one daemon call). Behaviour (DESIGN §4/§10):
+
+    * **Stale** (instance's inherited ``user.cw-build`` differs from the source's
+      current one — a later ``setup`` rebuilt the source): delete and recreate so
+      the new packages/provision/mounts actually reach this per-cwd instance.
+      **Liveness guard (T10):** never yank a *live* claude session — if the stale
+      instance is running with a live session, warn and reuse it this run; it is
+      recreated on the next run once idle.
+    * **Missing / just-deleted:** CoW-copy from the context template (or
+      ``claude-base`` for the *default* context), tag tier + context, add the
+      per-cwd project mount unless the cwd is subsumed by a context mount, start,
+      and wait for the agent + DNS.
+    * **Warm (current):** start it if stopped. Either way it is left running.
     """
-    info = incus.instance_info(instance)
+    insts = {i.get("name"): i for i in incus.list_instances()}
+    info = insts.get(instance)
+    source_info = insts.get(source)
+
+    if info is not None:
+        inst_build = (info.get("config") or {}).get(BUILD_KEY)
+        source_build = (source_info.get("config") or {}).get(BUILD_KEY) if source_info else None
+        if _instance_is_stale(inst_build, source_build):
+            if info.get("status") == "Running" and _has_live_session(instance):
+                print(f"warning: instance {instance} is stale (source {source} was "
+                      "rebuilt) but has a live claude session; reusing it this run. "
+                      "It will be recreated on the next run once idle.")
+            else:
+                print(f"Recreating stale instance {instance} "
+                      f"(source {source} was rebuilt)...")
+                incus.delete(instance, check=False)
+                info = None  # fall through to the cold (re)create path below
+
     if info is None:
-        if not incus.container_exists(source):
+        if source_info is None and not incus.container_exists(source):
             raise SetupError(
                 f"source container {source!r} is missing — run "
                 "`claude-wrapper setup` to (re)build the base/templates."
