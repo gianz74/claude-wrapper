@@ -17,6 +17,7 @@ import getpass
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -35,7 +36,13 @@ from .config import (
     ensure_user_config,
     load_config,
 )
-from .mounts import ensure_mask_dir, mask_container_paths, resolve, scope_hash
+from .mounts import (
+    _is_within,
+    ensure_mask_dir,
+    mask_container_paths,
+    resolve,
+    scope_hash,
+)
 
 if TYPE_CHECKING:  # avoid a run-time cli<->lifecycle import cycle
     from .cli import Mount
@@ -44,6 +51,12 @@ if TYPE_CHECKING:  # avoid a run-time cli<->lifecycle import cycle
 # (started, provisioned) by setup, then stopped and never run again.
 BASE = "claude-base"
 IMAGE = "images:ubuntu/24.04"
+
+# Container-private claude launcher dir (DESIGN §11/§8). Lives OUTSIDE $HOME so a
+# bind mount of host ~/.local/bin can never shadow it; _exec_env prepends it to
+# PATH ahead of ~/.local/bin so bare `claude` resolves to the container's own
+# binary even when the host ~/.local/bin is mounted over the container's.
+LAUNCHER_DIR = "/usr/local/lib/claude-wrapper/bin"
 
 # Tier-2 template naming: claude-sandbox-<ctx>. Tier-3 instances (T8) extend
 # this with -<hash8(scope)>, so we tag tier explicitly via incus `user.*` config
@@ -238,6 +251,46 @@ def _install_claude(host_user: str, home: str, method: str) -> None:
         )
 
 
+# --- container-private claude launcher (DESIGN §11/§8) -----------------------
+
+# Resolve the freshly-installed native claude and point a launcher at it from a
+# dir OUTSIDE $HOME. Run as root while ~/.local/bin/claude is still the
+# container's own symlink (before any host ~/.local/bin mount is attached).
+# $1 = launcher dir, $2 = ~/.local/bin/claude.
+_LAUNCHER_SCRIPT = r"""
+set -euo pipefail
+LAUNCHER_DIR="$1"
+CLAUDE_LINK="$2"
+target="$(readlink -f "$CLAUDE_LINK" || true)"
+if [ -z "$target" ] || [ ! -x "$target" ]; then
+    echo "private launcher: no executable claude at $CLAUDE_LINK (resolved '${target:-}')" >&2
+    exit 1
+fi
+mkdir -p "$LAUNCHER_DIR"
+ln -sfn "$target" "$LAUNCHER_DIR/claude"
+"""
+
+
+def _install_private_launcher(home: str, method: str) -> None:
+    """Create the container-private claude launcher (DESIGN §11/§8).
+
+    Only the *native* install lives under $HOME (``~/.local/bin/claude`` ->
+    ``~/.local/share/claude/versions/<v>``), so only it can be shadowed by a
+    host ``~/.local/bin`` mount. While ``~/.local/bin/claude`` is still the
+    container's own symlink, resolve the binary and symlink it from
+    :data:`LAUNCHER_DIR` (outside $HOME), which :func:`_exec_env` prepends to
+    PATH ahead of ``~/.local/bin``. The non-native install (``/usr/bin/claude``)
+    is not under any home mount and needs no launcher — the PATH prepend is then
+    harmless (the dir simply does not exist).
+    """
+    if method != "native":
+        return
+    claude_link = f"{home}/.local/bin/claude"
+    incus.exec_(
+        BASE, ["bash", "-c", _LAUNCHER_SCRIPT, "launcher", LAUNCHER_DIR, claude_link]
+    )
+
+
 # --- mounts ------------------------------------------------------------------
 
 
@@ -332,7 +385,12 @@ def build_base(
     print(f"Configuring identity: user={host_user!r}, home={home!r}...")
     _setup_identity(host_user, home)
 
-    _install_claude(host_user, home, _detect_install_method(home))
+    method = _detect_install_method(home)
+    _install_claude(host_user, home, method)
+    # Private launcher MUST be created here — after install, before the global
+    # mounts are attached — so `readlink -f ~/.local/bin/claude` still reads the
+    # container's own symlink (not a host ~/.local/bin mounted over it). §11/§8.
+    _install_private_launcher(home, method)
 
     provision.install_packages(BASE, cfg.setup.packages)
     provision.run_provision_script(BASE, cfg.setup.provision_script, label="global")
@@ -444,6 +502,116 @@ def build_templates(cfg: Config) -> None:
         _build_template(ctx)
 
 
+# --- host-install checks (DESIGN §13/§11/§8) ---------------------------------
+
+
+def _check_no_claude_shadow(cfg: Config, home: str) -> None:
+    """Hard-refuse a config whose mount would shadow the in-container claude (§8).
+
+    A mount whose container-side ``path`` is at or above ``~/.local/share/claude``
+    (the native binary) or :data:`LAUNCHER_DIR` (the private launcher) would
+    replace the container's own claude with host content and silently break
+    ``exec claude``. Detect → refuse; never mutate. The path logic reuses
+    :func:`mounts._is_within` — ``_is_within(protected, mount.path)`` is true
+    exactly when the mount sits at or above the protected location. Mounting
+    ``~/.local/bin`` alone is fine; the launcher lives outside it.
+    """
+    claude_share = os.path.join(home, ".local", "share", "claude")
+    protected = (
+        (claude_share, "the in-container claude binary (~/.local/share/claude)"),
+        (LAUNCHER_DIR, "the container-private claude launcher"),
+    )
+    specs: list[MountSpec] = list(cfg.mounts)
+    for ctx in cfg.contexts:
+        specs.extend(ctx.mounts)
+    for spec in specs:
+        for prot, what in protected:
+            if _is_within(prot, spec.path):
+                raise SetupError(
+                    f"mount {spec.path!r} is at or above {what} — it would shadow "
+                    "the container's own claude and silently break `exec claude`. "
+                    "Remove or narrow that mount. (Mounting ~/.local/bin alone is "
+                    "fine; the launcher lives outside it.)"
+                )
+
+
+def _claude_resolves_to_wrapper(
+    path_env: str,
+    wrapper_path: str,
+    *,
+    is_exec,
+    realpath,
+) -> tuple[bool, str | None]:
+    """Replicate the shell's first-match ``claude`` lookup over *path_env* (§13).
+
+    Returns ``(resolves_to_wrapper, found)`` where *found* is the first
+    executable ``<dir>/claude`` on the PATH (or ``None``), and the bool is true
+    iff that match canonicalises to the same file as *wrapper_path*. Pure:
+    *is_exec* and *realpath* are injected so the lookup is unit-testable without
+    touching the filesystem.
+    """
+    wrapper_real = realpath(wrapper_path)
+    for d in path_env.split(os.pathsep):
+        if not d:
+            continue
+        cand = os.path.join(d, "claude")
+        if is_exec(cand):
+            return realpath(cand) == wrapper_real, cand
+    return False, None
+
+
+def _check_claude_on_path(home: str) -> None:
+    """Advisory: check ``claude`` on $PATH launches the wrapper (DESIGN §13).
+
+    Detect → print → never mutate (the :func:`_check_subuid` idiom). Silent when
+    ``claude`` already resolves to the wrapper. Otherwise prints suggested
+    commands — a ``claude`` symlink to the wrapper in a $PATH dir of the user's
+    choosing, ordered ahead of the real binary — and flags any leftover legacy
+    ``~/.local/bin/claude-wrapper.py``/``.sh``. The package never creates the
+    shim, edits an rc, or deletes anything; the user decides where and runs them.
+    """
+    wrapper = shutil.which("claude-wrapper") or os.path.join(
+        home, ".local", "bin", "claude-wrapper"
+    )
+    ok, found = _claude_resolves_to_wrapper(
+        os.environ.get("PATH", ""),
+        wrapper,
+        is_exec=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
+        realpath=os.path.realpath,
+    )
+    if ok:
+        return
+
+    lines = ["", "NOTE: `claude` does not launch the sandbox on your $PATH."]
+    if found is not None:
+        lines.append(f"  `claude` currently resolves to: {found}")
+    else:
+        lines.append("  No `claude` was found on your $PATH.")
+    lines += [
+        "  For `claude` to start the sandbox, symlink the wrapper into a $PATH",
+        "  directory you control, ordered AHEAD of the real claude binary (any",
+        "  dir works — e.g. ~/bin):",
+        "",
+        f"      ln -s {wrapper} <DIR>/claude",
+        "",
+        "  then ensure <DIR> precedes the real binary's directory on $PATH.",
+    ]
+    legacy = [
+        p for p in (
+            os.path.join(home, ".local", "bin", "claude-wrapper.py"),
+            os.path.join(home, ".local", "bin", "claude-wrapper.sh"),
+        )
+        if os.path.exists(p)
+    ]
+    if legacy:
+        lines += [
+            "",
+            "  Leftover legacy wrapper file(s) detected — remove if unused:",
+            "      rm " + " ".join(legacy),
+        ]
+    print("\n".join(lines))
+
+
 # --- setup entry point (DESIGN §9) -------------------------------------------
 
 
@@ -461,6 +629,9 @@ def setup(cfg: Config | None = None) -> int:
     host_uid = os.getuid()
     host_gid = os.getgid()
     home = os.environ.get("HOME") or os.path.expanduser("~")
+    # §8 claude-shadow guard: refuse before any build work (the run path inherits
+    # this refusal via stamp-drift auto-setup, so it lives in setup only).
+    _check_no_claude_shadow(cfg, home)
     build_base(cfg, host_user=host_user, host_uid=host_uid, host_gid=host_gid, home=home)
     build_templates(cfg)
     _write_stamp(_config_stamp(config_path))
@@ -469,6 +640,9 @@ def setup(cfg: Config | None = None) -> int:
     n = len(cfg.contexts)
     print(f"setup: base + {n} context template(s) complete; stamp written"
           f"{result.summary_suffix()}.")
+    # §13 advisory: tell the user how to make `claude` launch the wrapper if it
+    # does not already resolve to it on $PATH (prints suggested commands only).
+    _check_claude_on_path(home)
     return 0
 
 
@@ -573,16 +747,19 @@ _FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "AWS_")
 
 
 def _exec_env(host_user: str, home: str) -> dict[str, str]:
-    """Env for ``exec claude``: identity, ``~/.local/bin`` PATH, forwarded vars.
+    """Env for ``exec claude``: identity, claude-launcher PATH, forwarded vars.
 
-    PATH prepends ``$HOME/.local/bin`` (where the native installer puts claude;
-    DESIGN §12). HOME/USER are set explicitly even though the renamed identity
+    PATH prepends the container-private launcher dir (:data:`LAUNCHER_DIR`) ahead
+    of ``$HOME/.local/bin`` (where the native installer puts claude; DESIGN
+    §11/§12). The launcher wins even when the host ``~/.local/bin`` is mounted
+    over the container's, so bare ``claude`` always resolves to the container's
+    own binary. HOME/USER are set explicitly even though the renamed identity
     already matches, so the exec never relies on incus's env defaults.
     """
     env = {
         "HOME": home,
         "USER": host_user,
-        "PATH": f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:"
+        "PATH": f"{LAUNCHER_DIR}:{home}/.local/bin:/usr/local/sbin:/usr/local/bin:"
                 "/usr/sbin:/usr/bin:/sbin:/bin",
     }
     for key, val in os.environ.items():
