@@ -283,7 +283,53 @@ def _parse_reaper(raw: object) -> ReaperConfig:
     )
 
 
-def _parse_context(raw: object, index: int) -> Context:
+# --- mount groups (`[mount_groups]` + context `include`, DESIGN §7.2) --------
+
+
+def _parse_mount_groups(raw: object) -> dict[str, tuple[MountSpec, ...]]:
+    """Parse ``[mount_groups.<name>]`` tables into a ``name -> mounts`` map.
+
+    Each group's ``mounts`` array is parsed exactly like ``[[contexts.mounts]]``
+    (inline or full tables). Parse-time-only — groups are flattened into the
+    contexts that ``include`` them and never stored on :class:`Config`.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("[mount_groups]: expected a table")
+    groups: dict[str, tuple[MountSpec, ...]] = {}
+    for name, body in raw.items():
+        where = f"[mount_groups.{name}]"
+        if not isinstance(body, dict):
+            raise ConfigError(f"{where}: expected a table")
+        raw_mounts = body.get("mounts", [])
+        if not isinstance(raw_mounts, list):
+            raise ConfigError(f"{where}.mounts: expected an array of tables")
+        groups[name] = tuple(
+            _parse_mount(m, f"{where}.mounts[{i}]") for i, m in enumerate(raw_mounts)
+        )
+    return groups
+
+
+def _flatten_context_mounts(
+    included: list[tuple[MountSpec, ...]], inline: tuple[MountSpec, ...]
+) -> tuple[MountSpec, ...]:
+    """Merge included-group mounts (in ``include`` order) then a context's own
+    inline mounts, deduped by container-side ``path`` with **later-wins** (inline
+    overrides an included mount of the same ``path``; a later group overrides an
+    earlier one). The flattened tuple is all downstream ever sees."""
+    merged: dict[str, MountSpec] = {}
+    for group_mounts in included:
+        for m in group_mounts:
+            merged[m.path] = m
+    for m in inline:
+        merged[m.path] = m
+    return tuple(merged.values())
+
+
+def _parse_context(
+    raw: object, index: int, groups: dict[str, tuple[MountSpec, ...]]
+) -> Context:
     where = f"[[contexts]][{index}]"
     if not isinstance(raw, dict):
         raise ConfigError(f"{where}: expected a table")
@@ -302,15 +348,29 @@ def _parse_context(raw: object, index: int) -> Context:
     raw_mounts = raw.get("mounts", [])
     if not isinstance(raw_mounts, list):
         raise ConfigError(f"context {name!r}.mounts: expected an array of tables")
-    mounts = tuple(
+    inline_mounts = tuple(
         _parse_mount(m, f"context {name!r}.mounts[{i}]")
         for i, m in enumerate(raw_mounts)
     )
+
+    include = (
+        _str_list(raw["include"], f"context {name!r}.include")
+        if "include" in raw
+        else ()
+    )
+    included: list[tuple[MountSpec, ...]] = []
+    for gname in include:
+        if gname not in groups:
+            raise ConfigError(
+                f"context {name!r}: unknown mount group {gname!r} in 'include'"
+            )
+        included.append(groups[gname])
+
     return Context(
         name=name,
         when=when,
         provision_script=_expand(script) if script is not None else None,
-        mounts=mounts,
+        mounts=_flatten_context_mounts(included, inline_mounts),
     )
 
 
@@ -340,10 +400,16 @@ def parse_config(data: dict, *, source: str = "<config>") -> Config:
         _parse_mount(m, f"[[mounts]][{i}]") for i, m in enumerate(raw_mounts)
     )
 
+    # Mount groups (§7.2): parsed here so contexts can `include` them; flattened
+    # into Context.mounts and never stored on Config.
+    groups = _parse_mount_groups(data.get("mount_groups"))
+
     raw_contexts = data.get("contexts", [])
     if not isinstance(raw_contexts, list):
         raise ConfigError("[[contexts]]: expected an array of tables")
-    contexts = tuple(_parse_context(c, i) for i, c in enumerate(raw_contexts))
+    contexts = tuple(
+        _parse_context(c, i, groups) for i, c in enumerate(raw_contexts)
+    )
 
     seen: set[str] = set()
     for ctx in contexts:
@@ -413,6 +479,13 @@ _DEFAULT_CONFIG_TOML = """\
 # claude-wrapper configuration. See DESIGN.md §7 for the full reference.
 # Host paths use ~ expansion. Paths absent on this machine are silently skipped.
 
+# --- Variables (§7.1) ---------------------------------------------------------
+# ${NAME} is substituted into every string below *before* ~ expansion, to keep
+# repeated path prefixes DRY. Brace form only (a bare $NAME is left literal).
+# Vars cannot reference other vars (single level, no recursion).
+# [vars]
+# WM = "~/.config/claude-wrapper/work-mappings"
+
 [setup]
 # apt packages installed into claude-base (inherited by every instance).
 packages = ["jq"]
@@ -439,18 +512,30 @@ path = "~/.claude.json"
 # path = "~/.aws"
 # mode = "ro"
 
+# --- Mount groups (§7.2) ------------------------------------------------------
+# A reusable, named bundle of mounts that several contexts can `include` — so a
+# shared credential set isn't duplicated across contexts. A group is NOT a
+# context: no `when`, no template, never matched by resolution. Each entry under
+# `mounts` is parsed exactly like a [[contexts.mounts]] table.
+# [mount_groups.acme-creds]
+# mounts = [
+#   { path = "~/.ssh",       from = "${WM}/.ssh",       mode = "ro" },
+#   { path = "~/.gnupg",     from = "${WM}/.gnupg",     mode = "ro" },
+#   { path = "~/.gitconfig", from = "${WM}/.gitconfig", mode = "ro" },
+# ]
+
 # --- Contexts: cwd-prefix-selected templates with their own mounts (§6/§7) ----
 # `name` is required (container = claude-sandbox-<name>). `when` is a list of
 # host path prefixes (OR); the longest matching prefix across all contexts wins.
+# `include` splices in mount groups (a list, or a bare string for one); a
+# context's own inline [[contexts.mounts]] override an included mount with the
+# same `path` (later wins).
 #
 # [[contexts]]
-# name = "api"
-# when = ["~/work/acme-api"]
+# name    = "api"
+# when    = ["~/work/acme-api"]
+# include = ["acme-creds"]
 # provision_script = "~/.config/claude-wrapper/provision-api.sh"
-#   [[contexts.mounts]]
-#   path = "~/.ssh"          # container-side location
-#   from = "~/.ssh-api"      # backed by this host dir (alias)
-#   mode = "ro"
 #   [[contexts.mounts]]
 #   path    = "~/work"  # whole-tree mount (broad)
 #   exclude = ["secrets"]  # masked: appears as an empty read-only dir

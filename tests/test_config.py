@@ -275,6 +275,154 @@ path = "/data/${A}"
     assert cfg.mounts[0].path == "/data/${B}/x"
 
 
+# --- mount groups + context `include` (DESIGN §7.2, TASKS T14) ---------------
+
+_CREDS_GROUP = """\
+[vars]
+WM = "~/work-mappings"
+
+[mount_groups.creds]
+mounts = [
+  { path = "~/.ssh",       from = "${WM}/.ssh",       mode = "ro" },
+  { path = "~/.gnupg",     from = "${WM}/.gnupg",     mode = "ro" },
+  { path = "~/.gitconfig", from = "${WM}/.gitconfig", mode = "ro" },
+]
+"""
+
+
+def test_two_contexts_share_group_plus_own(tmp_path):
+    text = _CREDS_GROUP + """\
+[[contexts]]
+name    = "api"
+when    = ["~/work/api"]
+include = ["creds"]
+  [[contexts.mounts]]
+  path = "~/work/api"
+
+[[contexts]]
+name    = "web"
+when    = ["~/work/web"]
+include = "creds"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    api, web = cfg.contexts
+
+    # both contexts carry the three group mounts (~-expanded, ${WM} resolved)
+    creds = {
+        os.path.expanduser("~/.ssh"): os.path.expanduser("~/work-mappings/.ssh"),
+        os.path.expanduser("~/.gnupg"): os.path.expanduser("~/work-mappings/.gnupg"),
+        os.path.expanduser("~/.gitconfig"): os.path.expanduser("~/work-mappings/.gitconfig"),
+    }
+    for ctx in (api, web):
+        by_path = {m.path: m for m in ctx.mounts}
+        for path, host in creds.items():
+            assert path in by_path, ctx.name
+            assert by_path[path].host_path == host
+            assert by_path[path].mode == "ro"
+
+    # api has its own extra mount; web (bare-string include) has only the creds
+    assert os.path.expanduser("~/work/api") in {m.path for m in api.mounts}
+    assert len(web.mounts) == 3
+
+
+def test_include_order_then_inline(tmp_path):
+    # included groups (in `include` order) come before the context's own inline
+    # mounts; first-seen position is stable.
+    text = """\
+[mount_groups.a]
+mounts = [{ path = "~/a1" }, { path = "~/a2" }]
+[mount_groups.b]
+mounts = [{ path = "~/b1" }]
+
+[[contexts]]
+name    = "x"
+when    = ["~/x"]
+include = ["a", "b"]
+  [[contexts.mounts]]
+  path = "~/own"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    paths = [m.path for m in cfg.contexts[0].mounts]
+    assert paths == [os.path.expanduser(p) for p in ("~/a1", "~/a2", "~/b1", "~/own")]
+
+
+def test_inline_overrides_group_mount(tmp_path):
+    # an inline mount with the same container `path` as a group mount wins
+    # (later-wins): asserted on mode + from_.
+    text = """\
+[mount_groups.creds]
+mounts = [{ path = "~/.ssh", from = "~/work-mappings/.ssh", mode = "ro" }]
+
+[[contexts]]
+name    = "x"
+when    = ["~/x"]
+include = ["creds"]
+  [[contexts.mounts]]
+  path = "~/.ssh"
+  mode = "rw"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    by_path = {m.path: m for m in cfg.contexts[0].mounts}
+    ssh = by_path[os.path.expanduser("~/.ssh")]
+    assert ssh.mode == "rw"            # inline mode wins
+    assert ssh.from_ is None           # inline is parity, overriding the alias
+    # deduped: only one ~/.ssh entry
+    assert [m.path for m in cfg.contexts[0].mounts].count(
+        os.path.expanduser("~/.ssh")
+    ) == 1
+
+
+def test_later_group_overrides_earlier(tmp_path):
+    text = """\
+[mount_groups.a]
+mounts = [{ path = "~/.ssh", mode = "ro" }]
+[mount_groups.b]
+mounts = [{ path = "~/.ssh", mode = "rw" }]
+
+[[contexts]]
+name    = "x"
+when    = ["~/x"]
+include = ["a", "b"]
+"""
+    cfg = load_config(_write(tmp_path, text))
+    by_path = {m.path: m for m in cfg.contexts[0].mounts}
+    assert by_path[os.path.expanduser("~/.ssh")].mode == "rw"  # later group wins
+
+
+def test_unknown_include_rejected(tmp_path):
+    text = """\
+[[contexts]]
+name    = "x"
+when    = ["~/x"]
+include = ["nope"]
+"""
+    with pytest.raises(
+        ConfigError, match=r"context 'x': unknown mount group 'nope'"
+    ):
+        load_config(_write(tmp_path, text))
+
+
+def test_template_build_id_tracks_group_change(tmp_path):
+    # changing a group's mounts changes the flattened Context.mounts, hence the
+    # template build-id of every context that includes it (T12 sensitivity).
+    from claude_wrapper import lifecycle
+
+    base = """\
+[mount_groups.creds]
+mounts = [{{ path = "~/.ssh", from = "~/work-mappings/.ssh", mode = "{mode}" }}]
+
+[[contexts]]
+name    = "x"
+when    = ["~/x"]
+include = ["creds"]
+"""
+    cfg_ro = load_config(_write(tmp_path, base.format(mode="ro"), "ro.toml"))
+    cfg_rw = load_config(_write(tmp_path, base.format(mode="rw"), "rw.toml"))
+    id_ro = lifecycle._template_build_id("base", cfg_ro.contexts[0])
+    id_rw = lifecycle._template_build_id("base", cfg_rw.contexts[0])
+    assert id_ro != id_rw
+
+
 def test_ensure_user_config_writes_defaults(tmp_path):
     d = tmp_path / "cfgdir"
     path = ensure_user_config(d)

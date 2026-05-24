@@ -188,7 +188,7 @@ surface it rather than guessing.
   braces is left untouched; existing var-less configs parse identically. Unit
   tests in `tests/` cover all four.
 
-- [ ] **T14 — Mount groups + context `include` (`config.py`, DESIGN §7.2).**
+- [x] **T14 — Mount groups + context `include` (`config.py`, DESIGN §7.2).**
   Add reusable named mount bundles so several contexts can share one set of
   mounts (e.g. credential mounts across `~/work` sub-tree contexts) without
   duplicating entries or inventing a `when`-bearing parent. Confine the whole
@@ -1159,3 +1159,57 @@ regression. New tests cover all four Done-when cases — (1) `[vars] WM = "~/x"`
 config parses identically — plus cross-section expansion (packages/when/
 provision_script/mounts) and the no-recursion case. End-to-end sanity via
 `parse_config` confirmed `SCHEMA_VERSION == 2` and the expansion+error paths.
+
+### 2026-05-24 — T14: Mount groups + context `include` (`config.py`)
+
+**Changed (`config.py` only — host-only, confined to `parse_config` per the
+plan; nothing downstream touched):**
+- Added `_parse_mount_groups(raw) -> dict[str, tuple[MountSpec, ...]]` — parses
+  `[mount_groups.<name>]` tables (each a `mounts` array parsed by the **existing
+  `_parse_mount`**, so inline *and* full tables both work). Parse-time-only; not
+  stored on `Config`.
+- Added `_flatten_context_mounts(included, inline)` — merges included-group
+  mounts (in `include` order) **then** the context's own inline mounts into a
+  dict keyed by container-side `path`, **later-wins** (so a plain dict assign:
+  position = first occurrence, value = winner). Returns the deduped tuple.
+- `_parse_context` now takes the `groups` map, reads optional `include`
+  (`_str_list`, bare string ok), validates each name (unknown → `ConfigError`
+  naming the group **and** the context), and sets `Context.mounts` to the
+  flattened result. `parse_config` parses groups once and threads them in.
+- Refreshed `_DEFAULT_CONFIG_TOML` with commented `[vars]`, `[mount_groups]` and
+  `include` examples mirroring DESIGN §7.1/§7.2.
+
+**Decisions / gotchas:**
+- **Build-id sensitivity is automatic, not special-cased** — `_template_build_id`
+  (T12) hashes `_mount_inputs(ctx.mounts)` *in order*, and the flattened group
+  mounts land in `ctx.mounts`, so changing a group's mounts changes the build-id
+  of every context that includes it (→ T12 recreates those instances). Verified
+  by a unit test that flips a group mount's `mode` ro↔rw and asserts the ids
+  differ. **No code outside `parse_config` changed**, exactly as the design
+  intended (template build, scope-keying §5, masking/guards §8 all already
+  operate on `Context.mounts`).
+- **Dedup order = first-occurrence position, winner value** (plain-dict idiom).
+  Deterministic, so build-ids are stable. The DESIGN only fixes the *value*
+  (later-wins); position among the group block is first-seen — a unit test pins
+  `[a1, a2, b1, own]` order so this can't silently drift.
+- **`SCHEMA_VERSION` already 2** from T13 — not bumped again (the design said to
+  bump only if T14 landed first; it didn't).
+- **`${VAR}` reaches group mounts for free** — the T13 pre-pass walks the whole
+  dict including `mount_groups` before any parsing, so `from = "${WM}/.ssh"` in a
+  group resolves. Confirmed with the worked example.
+- **`_DEFAULT_CONFIG_TOML` examples are valid** — verified by uncommenting the
+  §7.1/§7.2 block and parsing it (group included, `${WM}` resolved, exclude kept).
+- **Mount groups carry no `when`/template/instance** (DESIGN §7.2) — they never
+  reach `build_templates`/resolution; only the flattened `Context.mounts` does.
+  Project is now **T1–T14 complete** (the full TASKS.md list).
+
+**Verified:** `python3 -m pytest -q` → **149 passed** (143 prior + 6 new), no
+regression. New tests cover all four Done-when cases — (1) two contexts each
+`include`ing a 3-mount `from`-aliased creds group both carry those three (one
+via list, one via bare-string `include`) plus their own; (2) inline `~/.ssh`
+overrides the group's (asserted `mode`==rw + `from_` None, single deduped
+entry); (3) unknown `include` → `ConfigError` matching `context 'x': unknown
+mount group 'nope'`; (4) `_template_build_id` differs when a group mount's mode
+changes — plus include-order (`[a1,a2,b1,own]`) and later-group-overrides-earlier.
+The shipped default config still loads cleanly (existing test) and its new
+commented example parses when uncommented.
