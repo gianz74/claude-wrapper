@@ -854,7 +854,7 @@ def _reap_due(now: int | None = None) -> bool:
 # Host env forwarded into the exec. Terminal/locale so the TUI renders right;
 # IDE hints so claude-code-ide recognises its host (§12); cloud/proxy/cert knobs
 # claude honours. The matching credential *files* are exposed via config
-# [[mounts]] (DESIGN §7), not hardcoded here. ANTHROPIC_*/CLAUDE_*/AWS_* are
+# [[mounts]] (DESIGN §7), not hardcoded here. ANTHROPIC_*/CLAUDE_* are
 # forwarded by prefix (covers the API key, feature flags, CLAUDE_CODE_SSE_PORT).
 _FORWARD_ENV = (
     "TERM", "COLORTERM", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
@@ -862,9 +862,9 @@ _FORWARD_ENV = (
     "TERM_PROGRAM", "FORCE_CODE_TERMINAL",
     "CLOUD_ML_REGION", "NODE_EXTRA_CA_CERTS", "GOOGLE_APPLICATION_CREDENTIALS",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "no_proxy", "API",
+    "http_proxy", "https_proxy", "no_proxy",
 )
-_FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "AWS_")
+_FORWARD_PREFIXES = ("ANTHROPIC_", "CLAUDE_")
 
 
 def _exec_env(

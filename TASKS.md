@@ -405,6 +405,38 @@ surface it rather than guessing.
   rule and the absolute/`[vars]` workaround. No `SCHEMA_VERSION`/build-id impact
   either way (env + `[vars]` are already runtime-only / pre-flattened per T17).
 
+- [ ] **T19 — Surface deployment-specific forwarded env into config (`[env].forward`,
+  DESIGN §7.3/§12).** The hardcoded `_FORWARD_ENV` baseline in `lifecycle.py` bakes
+  machine/deployment-specific vars into the otherwise-generic package. Relocate the
+  deployment-specific forwards into the **shipped example config's global
+  `[env].forward`** so they are explicit and auditable per-machine, keeping only the
+  universal render/auth baseline hardcoded. (Decision recorded 2026-05-24 alongside
+  the repo scrub; a company-specific tooling var and the `AWS_` prefix were already
+  removed in that scrub.)
+  - **Stays hardcoded (universal, nothing to configure):** terminal/locale (`TERM`,
+    `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`), IDE hints (`TERM_PROGRAM`,
+    `FORCE_CODE_TERMINAL`), and the `ANTHROPIC_*`/`CLAUDE_*` **prefixes** (a prefix
+    can't be expressed as a `forward = [...]` name list, so it must stay in code).
+  - **Moves to example `[env].forward`:** `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+    (+ lowercase), `NODE_EXTRA_CA_CERTS`, `CLOUD_ML_REGION`,
+    `GOOGLE_APPLICATION_CREDENTIALS`.
+  - **Behavioral consequence to document:** the shipped example config is
+    *documentation, not an auto-loaded default*, so relocating means these vars are
+    **no longer forwarded by default on any machine** until that machine's real
+    `config.toml` lists them. Intentional — it keeps the package generic (no baked-in
+    proxy/cloud assumptions); a Bedrock user likewise re-adds AWS creds **by name**.
+  - **Needs a DESIGN edit first:** §7.3 (line ~255) documents the baseline as
+    terminal/locale + IDE hints + prefixes; narrow it to the universal set and point
+    the deployment knobs at the example `[env].forward`. Update §12 if it echoes the
+    prefix list.
+  **Done when:** `_FORWARD_ENV` is trimmed to the universal baseline; DESIGN §7.3/§12
+  reflect the narrower hardcoded set + the example `[env].forward`; `config.py`
+  `_DEFAULT_CONFIG_TOML` shows the relocated vars in a global `[env] forward = [...]`;
+  the README env note matches; `tests/test_exec_env.py` keeps the `TERM` baseline test
+  and adds coverage that a relocated var is **not** forwarded by default but **is**
+  when named in `[env].forward`. No `SCHEMA_VERSION`/build-id impact (env is
+  runtime-only per T17).
+
 ---
 
 ## Progress log

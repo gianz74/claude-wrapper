@@ -9,8 +9,8 @@ subcommands. Supersedes the single-file `~/.local/bin/claude-wrapper.py`.
 - Run `claude` against the **current working directory** plus a configurable
   **selection of host files/directories**, isolated from the rest of the host.
 - Strong isolation suited to running `claude` on **untrusted repo content**
-  (untrusted code, arbitrary `work`): a compromised session must not reach
-  sibling projects or secrets material.
+  (third-party code, security-sensitive trees): a compromised session must not
+  reach sibling projects or private material.
 - Fast, lean hot path; heavy work confined to an explicit `setup`.
 - Cross-machine portable (personal laptop + work laptop with an sssd `@`
   username and a non-1000 UID).
@@ -253,7 +253,7 @@ include = ["acme-creds"]
 ### 7.3 Environment variables (`[env]` + context `env`)
 
 Beyond the hardcoded baseline the wrapper always forwards (terminal/locale, IDE
-hints, the `ANTHROPIC_`/`CLAUDE_`/`AWS_` prefixes — §12), a user can declare
+hints, the `ANTHROPIC_`/`CLAUDE_` prefixes — §12), a user can declare
 extra env in config. **Env is a run-path concern only:** it is applied at
 `exec claude` time, *never* baked into `claude-base`/templates. So it touches no
 rootfs, is **not** part of the §4 build-id, needs **no** `SCHEMA_VERSION` bump,

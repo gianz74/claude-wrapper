@@ -16,7 +16,7 @@ reach the rest of your host.
 ## Why
 
 - **Isolation for untrusted content.** Running `claude` against arbitrary
-  `git-pull`s, untrusted code, or secrets material shouldn't expose sibling projects.
+  repos or security-sensitive material shouldn't expose sibling projects.
   Each working directory gets its own throwaway container; blast radius is scoped.
 - **Fast hot path.** All the heavy work (image build, package install, identity
   setup) happens once in an explicit `setup`. A warm relaunch is ~3 daemon calls

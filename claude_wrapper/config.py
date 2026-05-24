@@ -591,7 +591,7 @@ max_instances       = 0       # 0 = unlimited; else LRU-delete beyond this
 
 # --- Environment (§7.3) -------------------------------------------------------
 # Extra env passed into the sandbox at `exec claude`, on top of the always-
-# forwarded baseline (terminal/locale, IDE hints, ANTHROPIC_*/CLAUDE_*/AWS_*).
+# forwarded baseline (terminal/locale, IDE hints, ANTHROPIC_*/CLAUDE_*).
 # Run-path-only: applied at launch, never baked in, so an [env] edit never
 # rebuilds or recreates an instance. Literal KEY = "value" sets it verbatim
 # (${VAR} from [vars] expands; no ~ expansion); the reserved `forward` key lists
