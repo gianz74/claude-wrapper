@@ -107,8 +107,12 @@ block and everything after passes to `claude`:
 claude --mount /data:ro -- --resume
 ```
 
-Editing `config.toml` flips a local stamp, so the **next launch auto-runs `setup`
-exactly once** to re-provision.
+Editing a **build-relevant** part of `config.toml` — or the *contents* of a
+provision script — flips a local stamp, so the **next launch auto-runs `setup`
+exactly once** to re-provision. The stamp is keyed on the config's build identity
+(packages, mounts, provision-script contents, the set of contexts), so
+**runtime-only edits never rebuild**: changing `[env]` or `[reaper]` takes effect
+on the next launch with no `setup` (DESIGN §10).
 
 ### Management subcommands
 
@@ -169,7 +173,10 @@ Key config concepts:
   credential store). Credentials should be `mode = "ro"` by convention.
 - **`[vars]` (§7.1)** — TOML has no interpolation, so the loader does a `${NAME}`
   pre-pass (brace form only; a bare `$NAME` is left literal). Single level, no
-  recursion. Undefined `${NAME}` is an error.
+  recursion. Undefined `${NAME}` is an error. `${HOME}` and `${USER}` are always
+  available (seeded from the host, overridable by a `[vars]` entry) — use `${HOME}`
+  for a home-relative `[env]` value the consuming tool won't `~`-expand. They work
+  in mount paths too (host `$HOME`/`$USER` == container's, §3 identity).
 - **Mount groups (§7.2)** — a named, reusable bundle of mounts that contexts
   `include`. A group is *not* a context: no `when`, no template, no instance. An
   inline `[[contexts.mounts]]` overrides an included mount with the same `path`.
@@ -224,7 +231,9 @@ recorded in the `TASKS.md` progress log.
 
 ## Status
 
-Tasks **T1–T15 complete** — the full `TASKS.md` list. Build, run path, MCP/IDE
+Tasks **T1–T19 complete** — the full `TASKS.md` list. Build, run path, MCP/IDE
 bridge, reaper/gc/delete, host-install checks, instance recreation on source
-rebuild, `${VAR}` expansion, mount groups, and context-keyed scope dedup are all
+rebuild, `${VAR}` expansion (incl. implicit `${HOME}`/`${USER}`), mount groups,
+context-keyed scope dedup, user-declared `[env]` (literals + host `forward`), and
+a build-identity-keyed config stamp (runtime-only edits skip the rebuild) are all
 implemented and verified against the DESIGN §15 acceptance matrix.
