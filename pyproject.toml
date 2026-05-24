@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]      # PEP 639 SPDX license expression support
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Run the claude CLI inside an isolated incus sandbox."
 readme = "DESIGN.md"
 requires-python = ">=3.11"        # tomllib is stdlib from 3.11
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []                  # stdlib only by design
 
 [project.optional-dependencies]

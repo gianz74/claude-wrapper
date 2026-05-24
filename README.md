@@ -237,3 +237,7 @@ rebuild, `${VAR}` expansion (incl. implicit `${HOME}`/`${USER}`), mount groups,
 context-keyed scope dedup, user-declared `[env]` (literals + host `forward`), and
 a build-identity-keyed config stamp (runtime-only edits skip the rebuild) are all
 implemented and verified against the DESIGN §15 acceptance matrix.
+
+## License
+
+[MIT](LICENSE) © 2026 Giampaolo Fresi Roglia
