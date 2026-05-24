@@ -188,6 +188,93 @@ def test_duration_units(tmp_path, value, seconds):
     assert cfg.reaper.stop_idle_after == seconds
 
 
+# --- [vars] / ${NAME} expansion (DESIGN §7.1, TASKS T13) ---------------------
+
+
+def test_vars_expansion_in_mount_from(tmp_path):
+    text = """\
+[vars]
+WM = "~/x"
+
+[[contexts]]
+name = "v"
+when = ["~/proj"]
+  [[contexts.mounts]]
+  path = "~/.gnupg"
+  from = "${WM}/.gnupg"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    mount = cfg.contexts[0].mounts[0]
+    # ${WM} substituted first, then ~ expanded -> /home/<user>/x/.gnupg
+    assert mount.host_path == os.path.expanduser("~/x/.gnupg")
+    assert mount.path == os.path.expanduser("~/.gnupg")
+
+
+def test_undefined_var_rejected_naming_the_key(tmp_path):
+    text = """\
+[[mounts]]
+path = "${NOPE}/data"
+"""
+    with pytest.raises(ConfigError, match=r"undefined variable \$\{NOPE\}"):
+        load_config(_write(tmp_path, text))
+
+
+def test_bare_dollar_name_left_literal(tmp_path):
+    # No braces -> not a substitution target; the literal string survives.
+    text = '[[mounts]]\npath = "/data/$HOME/x"\n'
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.mounts[0].path == "/data/$HOME/x"
+
+
+def test_varless_config_parses_identically(tmp_path):
+    # The pre-pass must be a no-op when there is no [vars] table / no ${...}.
+    cfg = load_config(_write(tmp_path, SAMPLE))
+    assert [m.path for m in cfg.mounts] == [
+        os.path.expanduser("~/.claude"),
+        os.path.expanduser("~/.aws"),
+    ]
+    assert cfg.contexts[0].mounts[0].host_path == os.path.expanduser("~/.ssh-api")
+
+
+def test_vars_expansion_across_sections(tmp_path):
+    # ${NAME} reaches every string: packages, when, provision_script, mounts.
+    text = """\
+[vars]
+ROOT = "~/work"
+PKG = "ripgrep"
+
+[setup]
+packages = ["${PKG}"]
+
+[[contexts]]
+name = "v"
+when = ["${ROOT}/a"]
+provision_script = "${ROOT}/prov.sh"
+  [[contexts.mounts]]
+  path = "${ROOT}/a"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.setup.packages == ("ripgrep",)
+    assert cfg.contexts[0].when == (os.path.expanduser("~/work/a"),)
+    assert cfg.contexts[0].provision_script == os.path.expanduser(
+        "~/work/prov.sh"
+    )
+    assert cfg.contexts[0].mounts[0].path == os.path.expanduser("~/work/a")
+
+
+def test_vars_value_not_recursively_expanded(tmp_path):
+    # A ${...} inside a [vars] value is inserted verbatim, never re-resolved.
+    text = """\
+[vars]
+A = "${B}/x"
+
+[[mounts]]
+path = "/data/${A}"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.mounts[0].path == "/data/${B}/x"
+
+
 def test_ensure_user_config_writes_defaults(tmp_path):
     d = tmp_path / "cfgdir"
     path = ensure_user_config(d)

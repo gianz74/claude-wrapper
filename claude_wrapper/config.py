@@ -5,6 +5,12 @@ Loads ``~/.config/claude-wrapper/config.toml`` via :mod:`tomllib` and models
 dataclasses. All host paths are ``~``-expanded at load time so downstream code
 never has to.
 
+A ``[vars]`` table (DESIGN §7.1) supplies ``${NAME}`` substitution — a verbatim
+pre-pass over every other string value, run *before* ``~`` expansion — so
+per-machine configs can stop repeating long path prefixes. TOML has no native
+interpolation; this is the loader's own sugar, consumed at parse time and absent
+from the runtime :class:`Config`.
+
 Public surface:
 
 * :class:`Config` (+ :class:`SetupConfig`, :class:`ReaperConfig`,
@@ -28,11 +34,16 @@ from pathlib import Path
 
 # Bumped when the *shape* of the config changes incompatibly. Folded into the
 # lifecycle stamp hash (DESIGN §10) so a schema change forces a re-`setup`.
-SCHEMA_VERSION = 1
+# v2: ``[vars]`` ``${NAME}`` expansion (T13) + mount groups / ``include`` (T14).
+SCHEMA_VERSION = 2
 
 _VALID_MODES = ("ro", "rw")
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhd]?)\s*$")
+
+# Brace form only — a bare ``$NAME`` is left literal so paths containing ``$``
+# survive untouched. Names match a conventional identifier.
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class ConfigError(Exception):
@@ -150,6 +161,59 @@ def _parse_duration(value: object, where: str) -> int:
     )
 
 
+# --- variable expansion (`[vars]`, DESIGN §7.1) ------------------------------
+
+
+def _parse_vars(raw: object) -> dict[str, str]:
+    """Parse the ``[vars]`` table into a flat ``name -> str`` map.
+
+    Values are used verbatim — a ``${...}`` inside a var value is *not* resolved
+    (no recursion, vars cannot reference vars).
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("[vars]: expected a table")
+    variables: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"[vars].{name}: expected a string, got {type(value).__name__}"
+            )
+        variables[name] = value
+    return variables
+
+
+def _substitute_vars(value: object, variables: dict[str, str], where: str) -> object:
+    """Recursively replace ``${NAME}`` in every string under *value*.
+
+    Brace form only; an undefined ``${NAME}`` raises :class:`ConfigError` naming
+    the variable (and where it appeared). Non-string scalars pass through.
+    """
+    if isinstance(value, str):
+
+        def _replace(m: re.Match[str]) -> str:
+            name = m.group(1)
+            if name not in variables:
+                raise ConfigError(
+                    f"{where}: undefined variable ${{{name}}} "
+                    "(define it under [vars])"
+                )
+            return variables[name]
+
+        return _VAR_RE.sub(_replace, value)
+    if isinstance(value, dict):
+        return {
+            k: _substitute_vars(v, variables, f"{where}.{k}") for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _substitute_vars(v, variables, f"{where}[{i}]")
+            for i, v in enumerate(value)
+        ]
+    return value
+
+
 # --- section parsers ---------------------------------------------------------
 
 
@@ -258,6 +322,16 @@ def parse_config(data: dict, *, source: str = "<config>") -> Config:
     """
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: top level must be a table")
+
+    # `${NAME}` pre-pass (DESIGN §7.1): substitute into every string value
+    # *except* the [vars] table itself, before the section parsers (and their
+    # `~` expansion) run. [vars] is then dropped — it has no runtime effect.
+    variables = _parse_vars(data.get("vars"))
+    data = {
+        key: _substitute_vars(value, variables, key)
+        for key, value in data.items()
+        if key != "vars"
+    }
 
     raw_mounts = data.get("mounts", [])
     if not isinstance(raw_mounts, list):

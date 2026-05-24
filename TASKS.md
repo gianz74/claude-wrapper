@@ -167,7 +167,7 @@ surface it rather than guessing.
   left running and reused. Unit-test the pure drift decision (instance build-id
   vs. source build-id → recreate?) with injected tag values.
 
-- [ ] **T13 — `${VAR}` config expansion (`config.py`, DESIGN §7.1).** Add a
+- [x] **T13 — `${VAR}` config expansion (`config.py`, DESIGN §7.1).** Add a
   `[vars]` table + `${NAME}` substitution so per-machine configs stop repeating
   long path prefixes (TOML has no native interpolation — this is our loader's
   own pre-pass). Implement as a **single pre-pass over the raw parsed-TOML dict**
@@ -1112,3 +1112,50 @@ credential mounts) along two axes — (1) stop repeating the long
 
 **Verified:** none — design + task draft only. No code changed; `DESIGN.md`
 (§6 bullet + §7.1/§7.2) and `TASKS.md` (T13, T14, this log entry) only.
+
+### 2026-05-24 — T13: `${VAR}` config expansion (`config.py`)
+
+**Changed (`config.py` only — host-only pure logic, no sandbox needed):**
+- Bumped `SCHEMA_VERSION` 1 → 2 (folds into the §10 stamp → forces one
+  re-`setup`; T14 reuses 2, no further bump).
+- Added `_VAR_RE = r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"` (brace form only), plus
+  `_parse_vars(raw) -> dict[str,str]` (flat `[vars]` table; non-string value →
+  `ConfigError`) and `_substitute_vars(value, variables, where)` (recursive walk
+  over str/dict/list; `re.sub` callback raises `ConfigError` on an undefined
+  `${NAME}`, naming the var + where it appeared; non-string scalars pass through).
+- Wired a **single pre-pass at the top of `parse_config`**, *before* the section
+  parsers: parse `[vars]`, rebuild `data` with `${NAME}` substituted into every
+  value **except** the `vars` key, and drop `vars` from the dict. The existing
+  parsers (and their `_expand`/`expanduser`) are **untouched** — `${VAR}` is
+  resolved first, `~` second.
+- Added 6 tests to `tests/test_config.py`.
+
+**Decisions / gotchas for T14:**
+- **`[vars]` is dropped from `data` in the pre-pass** (dict comprehension skips
+  the `vars` key), so it never reaches a section parser and isn't on `Config`.
+  **T14's `[mount_groups]` must do the same** — flatten into `Context.mounts` at
+  parse time, don't store groups on `Config` (DESIGN §7.2). The §7.2 group
+  example's `${WM}` already works because substitution runs over the whole dict
+  including `mount_groups` before any parsing.
+- **No recursion is automatic, not special-cased:** `re.sub` does a single pass,
+  so a `${...}` *inside* a substituted value (e.g. a var defined as `"${B}/x"`)
+  is inserted verbatim and never re-scanned — `${B}` survives literally and does
+  **not** raise undefined (test `test_vars_value_not_recursively_expanded`). The
+  `vars` key is excluded from the walk too, so var *values* are never scanned.
+- **Bare `$NAME` is left literal** (brace-only regex) so `$`-paths survive — the
+  reason `expandvars` was rejected in the design (test
+  `test_bare_dollar_name_left_literal`).
+- **`SCHEMA_VERSION` is now 2** — the stamp tests don't hardcode it (they hash
+  whatever it is), so the bump is transparent. A real user with an existing
+  stamp will auto-`setup` once on next run (intended, per the design note).
+- **`_DEFAULT_CONFIG_TOML` intentionally NOT touched** — T14 owns refreshing it
+  with the worked `[vars]` + `[mount_groups]` + `include` example.
+
+**Verified:** `python3 -m pytest -q` → **143 passed** (137 prior + 6 new), no
+regression. New tests cover all four Done-when cases — (1) `[vars] WM = "~/x"` +
+`from = "${WM}/.gnupg"` → `host_path` == `~/x/.gnupg` expanded; (2) undefined
+`${NOPE}` → `ConfigError` matching `undefined variable ${NOPE}`; (3) bare
+`$HOME`-style string with no braces left untouched; (4) the var-less `SAMPLE`
+config parses identically — plus cross-section expansion (packages/when/
+provision_script/mounts) and the no-recursion case. End-to-end sanity via
+`parse_config` confirmed `SCHEMA_VERSION == 2` and the expansion+error paths.
