@@ -71,24 +71,37 @@ idle instance is a ~tens-of-MB userspace process tree, not a VM.
 
 ## 5. Per-cwd instances & scope keying
 
-Each runnable container is keyed on a **scope** — the largest host subtree the
-container exposes that contains the cwd:
+Each runnable container is keyed on a **scope** — the host subtree that defines
+its blast radius and therefore which cwds may share it:
 
-> **scope = the broadest `[[contexts.mounts]]` host path that contains the cwd;
-> else the project root (`git rev-parse --show-toplevel`); else the literal cwd.**
+> **scope = if the cwd is covered by *any* `[[contexts.mounts]]` host path → the
+> **context itself** (a per-context constant); else the project root
+> (`git rev-parse --show-toplevel`); else the literal cwd.**
 
-- Rationale: a context's mounts are baked into its template, so every instance
-  exposes them regardless of its hash. If a context mounts all of `~/work`,
-  keying on literal cwd would spawn one instance per leaf that each expose all
-  of `~/work` anyway — pure duplication. Keying on the covering mount makes
-  them share one instance; the broadest covering mount is the true blast radius.
+- Rationale: a context's mounts are *all* baked into its template, so every
+  instance of that context exposes the **union** of them regardless of which cwd
+  it was launched from. The true blast radius is the context, not any one mount.
+  So two *subsumed* launches of one context — e.g. `api` from `~/work` and
+  from `~/workspace`, where both trees are context mounts — would otherwise spawn
+  two instances that are byte-identical in what they expose: pure duplication
+  with zero isolation benefit (each already mounts the other's tree). Keying the
+  subsumed case on the context collapses them to one instance.
+- **Why not the broadest covering mount?** That was the original rule, and it
+  only deduplicated *within* a single covering mount: a context with two disjoint
+  covering mounts (`~/work` **and** `~/workspace`) still forked one instance
+  per mount. Keying on the context is the generalisation — the covering mount is
+  just the degenerate single-mount case of "the context's mounts contain the cwd".
 - **Subsumption:** when the cwd *is* covered by a context mount, **no separate
-  project mount is added** (it's already inside). Per-cwd isolation therefore
-  kicks in exactly where it helps — contexts whose mounts don't contain the cwd
-  (e.g. an ssh/gnupg-only context): each cwd gets its own isolated instance +
-  project mount.
+  project mount is added** (it's already inside) and the scope is the context
+  constant — so *all* subsumed cwds of a context share one instance. Per-cwd
+  isolation kicks in exactly where it helps — contexts whose mounts don't contain
+  the cwd (e.g. an ssh/gnupg-only context): the scope falls through to the project
+  root, so each cwd gets its own isolated instance + project mount.
 - Instance name: `claude-sandbox-<ctx>-<hash8(scope)>` (`<ctx>` = `default`
-  when no context matches). The ctx prefix keeps `incus list` groupable.
+  when no context matches). In the subsumed case the hashed scope is a constant
+  per-context token (e.g. `"ctx:<name>"`), so the suffix is stable across all of
+  that context's cwds and stays distinct from the bare `claude-sandbox-<ctx>`
+  template name. The ctx prefix keeps `incus list` groupable.
 
 ## 6. Context resolution
 
@@ -401,9 +414,11 @@ The rewrite is "done" when each of these passes:
 3. **Per-cwd isolation:** two sessions under an ssh-only context in *different*
    project dirs run in *different* instances; neither can see the other's
    project files.
-4. **Scope-keying / covering mount:** with a context mounting `~/work`,
-   launching from `~/work/A` and `~/work/B` lands in the *same*
-   instance (`…-<hash(~/work)>`), no separate project mount added.
+4. **Scope-keying / context dedup:** with a context mounting `~/work` *and*
+   `~/workspace`, launching from `~/work/A`, `~/work/B` and
+   `~/workspace/C` all land in the *same* instance (`…-<hash("ctx:<name>")>`),
+   no separate project mount added. A context whose mounts do **not** cover the
+   cwd still forks per project root (that is §15.3).
 5. **Masking:** an `exclude`d sub-path appears as an empty dir inside; its real
    contents are unreadable.
 6. **Whitelist:** with individual repo mounts (no parent), a sibling repo not in

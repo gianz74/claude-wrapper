@@ -218,6 +218,46 @@ surface it rather than guessing.
   Unit tests cover include-order, inline override, unknown-group, and the
   build-id sensitivity.
 
+- [ ] **T15 — Context-keyed scope dedup (`mounts.py`, DESIGN §5).** Fix the
+  multi-covering-mount duplication: a context with two *disjoint* covering mounts
+  (e.g. `api` mounting both `~/work` and `~/workspace`) currently forks one
+  instance **per covering mount** even though all of that context's instances CoW
+  from the same template and expose the **union** of its mounts — i.e. they are
+  byte-identical in blast radius (pure waste, no isolation gained). Key the
+  *subsumed* case on the context, not the covering mount. Confine the change to
+  `mounts.py` so **nothing downstream changes** (lifecycle just hashes whatever
+  `Resolution.scope` it gets):
+  - In `compute_scope`, when the cwd is covered by *any* context mount (today's
+    "`cover is not None`" branch), return `(f"ctx:{context.name}", False)` instead
+    of `(_norm(cover.path), False)`. The scope string is **only ever hashed** in
+    the subsumed branch (`add_project_mount` is `False`, so T8 never uses it as a
+    project-mount path — see the T6/T8 notes), which is what makes a non-path
+    token safe here. The `ctx:` prefix keeps it disjoint from real path scopes.
+  - `_broadest_covering_mount` no longer needs to pick the *broadest* — only
+    whether *a* covering mount exists. Either keep it (its result is now only
+    truth-tested) or simplify it to an `_is_subsumed(cwd, context) -> bool`
+    predicate. The non-subsumed fall-through (project root → cwd, with
+    `add_project_mount=True`) is **unchanged** — that is the §15.3 isolation path.
+  - **No `SCHEMA_VERSION` bump:** templates and the config *shape* are untouched
+    (this is instance-naming logic, not a config or template change), so the §10
+    stamp does not drift. Existing old-named duplicate instances (e.g.
+    `…-<hash(~/work)>` and `…-<hash(~/workspace)>`) are simply orphaned by
+    the new name and reaped naturally by `gc`/the reaper (they hold no unique
+    state); note this in the progress log so the user knows a one-off
+    `claude-wrapper gc` clears them immediately if desired.
+  - Update the `mounts.py` docstrings (module + `compute_scope`) and the existing
+    T6 scope tests (the §15.4 "A & B same hash" assertions now key on the
+    `ctx:<name>` constant, and `~/workspace/C` joins the same instance).
+  **Done when:** unit tests show (1) a context with disjoint covering mounts
+  `~/work`+`~/workspace` yields the *same* scope/hash and `add_project_mount
+  =False` for cwds `~/work/A`, `~/work/B`, **and** `~/workspace/C`
+  (revised §15.4); (2) the nested-mounts case (`~/work` + `~/work/foo`)
+  still collapses to one instance; (3) an ssh-only context whose mounts don't
+  cover the cwd still produces *distinct* project-root scopes/hashes with
+  `add_project_mount=True` per project (§15.3 preserved); (4) the subsumed scope
+  token is constant per context and `!=` the bare template name. `pytest -q`
+  green with no regression.
+
 ---
 
 ## Progress log
@@ -1213,3 +1253,51 @@ mount group 'nope'`; (4) `_template_build_id` differs when a group mount's mode
 changes — plus include-order (`[a1,a2,b1,own]`) and later-group-overrides-earlier.
 The shipped default config still loads cleanly (existing test) and its new
 commented example parses when uncommented.
+
+### 2026-05-24 — T15 added (multi-covering-mount scope dedup; NOT yet implemented)
+
+**Context:** User noticed that the real `api` context — `when = ["~/work",
+"~/workspace"]` with **both** trees as `[[contexts.mounts]]` — spawns *two*
+instances: launching under `~/work` keys on `hash8(~/work)` and under
+`~/workspace` keys on `hash8(~/workspace)`. Both CoW from the one
+`claude-sandbox-api` template, which bakes in **both** mounts, so the two
+instances are byte-identical in blast radius (each already mounts the other's
+tree). Wasted disk, zero isolation gained.
+
+**Root cause:** §5's original "scope = broadest covering mount" only dedups
+*within* a single covering mount. A context with two **disjoint** covering
+mounts forks one instance per mount. The earlier rule's "broadest covering mount
+is the true blast radius" claim only held for the single-covering-mount case the
+design considered; the actual blast radius of any instance is the **union** of
+its context's mounts — i.e. the context.
+
+**Design decision (with the user) → DESIGN §5 + §15.4 amended:**
+- **Key the *subsumed* case on the context, not the covering mount.** scope =
+  `if cwd covered by any context mount → "ctx:<name>" (constant) ; else project
+  root ; else cwd`. All subsumed cwds of a context now share one instance. The
+  covering mount becomes the degenerate single-mount case of "context mounts
+  contain the cwd".
+- **Per-cwd isolation (§15.3) is untouched** — that lives entirely in the
+  *non*-subsumed fall-through (project root → cwd, `add_project_mount=True`),
+  which the change does not touch. We only ever gave up per-cwd isolation when
+  subsumed (old §15.4); this extends that "subsumed cwds share" rule from
+  per-mount to per-context. No isolation regression: the merged instances already
+  exposed an identical mount set.
+- **Confined to `mounts.py`** (`compute_scope` returns the constant in the
+  subsumed branch; the token is only ever *hashed* there — `add_project_mount` is
+  `False`, so lifecycle never treats it as a path). Nothing downstream changes,
+  so it parallels T13/T14's "parse-time-only, model unchanged" shape but for the
+  scope layer. §15.4 reworded to assert the disjoint-mount collapse.
+- **No `SCHEMA_VERSION` bump** — instance-naming logic only; templates and config
+  shape unchanged, so the §10 stamp does not drift and no rebuild is forced.
+  Old-named duplicate instances are orphaned by the new name and reaped naturally
+  (they hold no unique state); a one-off `claude-wrapper gc` clears them at once.
+
+**Rejected alternative:** keep per-mount instances but strip each one's template
+to only its covering mount (real work/workspace isolation). Breaks the §4
+one-immutable-template-per-context CoW model (per-instance device sets, no
+single-`incus copy` mount inheritance) — far more machinery for isolation the
+user didn't ask for.
+
+**Verified:** none — design + task draft only. No code changed; `DESIGN.md`
+(§5 rewrite + §15.4) and `TASKS.md` (T15 + this entry) only.
