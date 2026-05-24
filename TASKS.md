@@ -258,6 +258,56 @@ surface it rather than guessing.
   token is constant per context and `!=` the bare template name. `pytest -q`
   green with no regression.
 
+- [ ] **T16 — User-declared env (`config.py` + `lifecycle._exec_env`, DESIGN §7.3).**
+  Let the config pass extra environment into the sandbox, both global and
+  per-context, as literal values **and** host pass-through — beyond the hardcoded
+  `_FORWARD_ENV`/prefix baseline. **Env is run-path-only** (applied at `exec
+  claude`, never baked), so it must touch **no** rootfs: **no `SCHEMA_VERSION`
+  bump**, **not** part of the T12 build-id, **never** recreates instances. Two
+  halves:
+  - **`config.py` (parse + validate + flatten):** parse a global `[env]` table and
+    an optional per-context `env` (inline table or `[contexts.env]` sub-table).
+    In each table, the reserved lowercase key `forward` is a `list[str]` of host
+    var names; every other pair is a literal `KEY = "value"`. Validate: env names
+    match `[A-Za-z_][A-Za-z0-9_]*`; values are strings (reject non-string with a
+    clear message); `forward` is a list of strings; `HOME`/`USER`/`PATH` in any
+    `[env]` → `ConfigError` (reserved — identity + §11 launcher). `${VAR}` (§7.1)
+    already expands in literal *values* via the existing pre-pass (a `forward`
+    name has no braces, so it's untouched) — **do not** `~`-expand env values
+    (they aren't paths; keep them out of the `_expand` path fields). Store on the
+    frozen models: add `env: Mapping[str,str]` + `forward: tuple[str,...]` to
+    `Config` (global) and to `Context` (per-context). Flatten nothing across
+    levels at parse time — keep global and per-context separate; the run path
+    merges them (it already has both `cfg` and `res.context`).
+  - **`lifecycle._exec_env` (merge + apply):** change the signature to take the
+    config + resolved context (it's called once in `run` at `lifecycle.py:1024`,
+    which already holds `cfg` and `res`). Assemble broadest→narrowest, later-wins:
+    (1) reserved `HOME`/`USER`/`PATH`; (2) the existing built-in forwarded
+    baseline (`_FORWARD_ENV` + `_FORWARD_PREFIXES`, `setdefault`); (3) user
+    `forward` = global ∪ context names, pulled from `os.environ`, **skipped if
+    unset** (same convention as an absent mount); (4) user literals — global,
+    then **context overrides global**; **literals override forwarded** (explicit
+    beats implicit); (5) re-assert `HOME`/`USER`/`PATH` last so nothing clobbers
+    identity. Reserved-key validation in `config.py` already prevents (4) from
+    setting them, so (5) is belt-and-suspenders.
+  - **Refresh `_DEFAULT_CONFIG_TOML`** with a commented `[env]` example (one
+    literal + one `forward` + a per-context `env`), mirroring DESIGN §7.3.
+  - **Confirm the build-id is untouched:** `_template_build_id` (T12) must **not**
+    fold env in — add a unit assertion that changing `[env]` leaves the build-id
+    equal (so an env-only edit never recreates instances; only the generic stamp
+    auto-`setup` fires).
+  **Done when:** DESIGN §15.12 passes — a global `[env]` literal and a `forward`
+  host var both reach the sandbox at exec time; a per-context `env` overrides the
+  global literal on a key collision; a literal overrides a same-named forwarded
+  var; a `forward` name unset on the host is skipped (not set empty); a reserved
+  `HOME`/`USER`/`PATH` in `[env]` is rejected at load with a clear message; the
+  T12 build-id is unchanged by an env edit. Unit tests cover: literal+forward
+  parse, name/value/`forward`-shape validation, reserved-key rejection, `${VAR}`
+  expansion in a literal value (and no `~` expansion), the full merge/precedence
+  order (built-in < forward < global literal < context literal), unset-forward
+  skip, and build-id insensitivity. Verify the merged env on a real `exec claude`
+  (a throwaway `printenv` is enough — no full TUI).
+
 ---
 
 ## Progress log

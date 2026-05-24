@@ -243,6 +243,52 @@ include = ["acme-creds"]
   the `SCHEMA_VERSION` bump (folded into the §10 stamp) forces one re-`setup`,
   which rebuilds templates and — via T12 — recreates instances on the new rootfs.
 
+### 7.3 Environment variables (`[env]` + context `env`)
+
+Beyond the hardcoded baseline the wrapper always forwards (terminal/locale, IDE
+hints, the `ANTHROPIC_`/`CLAUDE_`/`AWS_` prefixes — §12), a user can declare
+extra env in config. **Env is a run-path concern only:** it is applied at
+`exec claude` time, *never* baked into `claude-base`/templates. So it touches no
+rootfs, is **not** part of the §4 build-id, needs **no** `SCHEMA_VERSION` bump,
+and must **not** trigger instance recreation. (Editing `config.toml` still trips
+the §10 byte-hash stamp → one auto-`setup`; that is the generic config-edit cost,
+not an env rebuild — accepted, not special-cased.)
+
+```toml
+[env]
+EDITOR     = "vim"            # literal — set verbatim in every sandbox
+PATH_EXTRA = "${WM}/bin"      # ${VAR} (§7.1) expands; NO ~ expansion (env ≠ path)
+forward    = ["GH_TOKEN"]     # host vars passed through by name at launch
+
+[[contexts]]
+name = "api"
+when = ["~/work/acme-api"]
+env  = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }  # [contexts.env] sub-table also ok
+```
+
+- **Two mechanisms.** Literal `KEY = "value"` pairs set the value verbatim;
+  `forward = [...]` is a list of host var *names* whose values are taken from the
+  launching shell. A host var named in `forward` that is unset is **silently
+  skipped** (same convention as a host path absent on this machine).
+- **`forward` is a reserved key** inside an `[env]` table (lowercase; env names
+  are conventionally UPPERCASE, so no real collision). Everything else in the
+  table is a literal pair.
+- **`${VAR}` (§7.1) expands in literal values** (the pre-pass walks all strings);
+  `~` is **not** expanded (env values are not paths). `forward` entries are bare
+  names — no `${}`, untouched.
+- **Validation:** env names must match `[A-Za-z_][A-Za-z0-9_]*`; values must be
+  strings; `forward` must be a list of strings; `HOME`/`USER`/`PATH` are
+  **reserved** (identity + the §11 launcher) and may not appear in `[env]` →
+  `ConfigError`.
+- **Merge + precedence** (assembled in `_exec_env`, broadest → narrowest, later
+  wins): reserved `HOME`/`USER`/`PATH` → built-in forwarded baseline → user
+  `forward` (global ∪ context) → user literals (global, then **context overrides
+  global**; **literals override forwarded** — explicit beats implicit) →
+  `HOME`/`USER`/`PATH` re-asserted last so nothing clobbers identity.
+- Like `[vars]`/`[mount_groups]`, `[env]` and a context's `env` are flattened/read
+  at parse time; the resulting per-context effective env is what the run path
+  consumes.
+
 ## 8. Mount selection, masking, exclusions, refuse-guard
 
 - **Two postures, both supported:**
@@ -441,6 +487,13 @@ The rewrite is "done" when each of these passes:
     and on a host where `claude` does not resolve to the wrapper (no shim, or it
     sits behind the real binary on `$PATH`), `setup` prints suggested fix commands
     (and flags a leftover `~/.local/bin/claude-wrapper.py`/`.sh`).
+12. **Env (§7.3):** a global `[env]` literal and a `forward` host var both reach
+    the sandbox at `exec` time; a per-context `env` overrides the global literal
+    on a key collision; a literal overrides a same-named forwarded var; a `forward`
+    name unset on the host is skipped; setting a reserved `HOME`/`USER`/`PATH` in
+    `[env]` is rejected by config load; an env-only config edit does **not** change
+    the §4 build-id (no instance recreation) — only the generic one-shot
+    auto-`setup` from the stamp.
 
 ## 16. Open / deferred
 
