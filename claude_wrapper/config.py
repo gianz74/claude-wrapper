@@ -7,9 +7,12 @@ never has to.
 
 A ``[vars]`` table (DESIGN §7.1) supplies ``${NAME}`` substitution — a verbatim
 pre-pass over every other string value, run *before* ``~`` expansion — so
-per-machine configs can stop repeating long path prefixes. TOML has no native
-interpolation; this is the loader's own sugar, consumed at parse time and absent
-from the runtime :class:`Config`.
+per-machine configs can stop repeating long path prefixes. ``${HOME}`` and
+``${USER}`` are always available (seeded from the host, overridable by an
+explicit ``[vars]`` entry) so a home-relative value can be written where the
+consuming tool won't ``~``-expand it — notably ``[env]`` values, which are
+literal by design (§7.3). TOML has no native interpolation; this is the loader's
+own sugar, consumed at parse time and absent from the runtime :class:`Config`.
 
 Public surface:
 
@@ -177,6 +180,20 @@ def _parse_duration(value: object, where: str) -> int:
 
 
 # --- variable expansion (`[vars]`, DESIGN §7.1) ------------------------------
+
+
+def _implicit_vars() -> dict[str, str]:
+    """Vars always available to the ``${NAME}`` pre-pass, overridable by an
+    explicit ``[vars]`` entry of the same name.
+
+    ``${HOME}`` / ``${USER}`` let a config express a home-relative value that the
+    *consuming* tool won't ``~``-expand itself — e.g. ``GIT_CONFIG_GLOBAL`` in
+    ``[env]``, whose values are literal by design (§7.3). Because host
+    HOME==container HOME and host USER==container USER (§3 identity), one value is
+    correct on both sides of every mount.
+    """
+    home = os.path.expanduser("~")
+    return {"HOME": home, "USER": os.environ.get("USER") or os.path.basename(home)}
 
 
 def _parse_vars(raw: object) -> dict[str, str]:
@@ -452,7 +469,9 @@ def parse_config(data: dict, *, source: str = "<config>") -> Config:
     # `${NAME}` pre-pass (DESIGN §7.1): substitute into every string value
     # *except* the [vars] table itself, before the section parsers (and their
     # `~` expansion) run. [vars] is then dropped — it has no runtime effect.
-    variables = _parse_vars(data.get("vars"))
+    # Implicit ${HOME}/${USER} are seeded first so an explicit [vars] entry of
+    # the same name still wins (later key overrides in the merge).
+    variables = {**_implicit_vars(), **_parse_vars(data.get("vars"))}
     data = {
         key: _substitute_vars(value, variables, key)
         for key, value in data.items()
@@ -553,6 +572,9 @@ _DEFAULT_CONFIG_TOML = """\
 # ${NAME} is substituted into every string below *before* ~ expansion, to keep
 # repeated path prefixes DRY. Brace form only (a bare $NAME is left literal).
 # Vars cannot reference other vars (single level, no recursion).
+# ${HOME} and ${USER} are always available (overridable by a [vars] entry) — use
+# ${HOME} for a home-relative value the consuming tool won't ~-expand (e.g. an
+# [env] value below).
 # [vars]
 # WM = "~/.config/claude-wrapper/work-mappings"
 
@@ -575,10 +597,14 @@ max_instances       = 0       # 0 = unlimited; else LRU-delete beyond this
 # (${VAR} from [vars] expands; no ~ expansion); the reserved `forward` key lists
 # host var names passed through by value (an unset host var is skipped). A
 # per-context `env` overrides the global one on a key collision.
-# HOME/USER/PATH are reserved and rejected.
+# HOME/USER/PATH are reserved and rejected. Env values are literal — ~ is NOT
+# expanded; for a home-relative path use ${HOME} (e.g. to point git at a config
+# inside a *directory* mount, since a single-file ~/.gitconfig bind mount can't
+# be rewritten atomically).
 # [env]
-# EDITOR  = "vim"
-# forward = ["GH_TOKEN"]
+# EDITOR             = "vim"
+# GIT_CONFIG_GLOBAL  = "${HOME}/.config/git/config"
+# forward            = ["GH_TOKEN"]
 
 # --- Global persistent mounts: baked into claude-base, inherited everywhere ---
 # `path` is the mount location (host & container identical). `from` aliases a

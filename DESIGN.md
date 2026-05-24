@@ -187,6 +187,13 @@ WM = "~/.config/claude-wrapper/work-mappings"
   pre-pass run **before** `~` expansion. Names match `[A-Za-z_][A-Za-z0-9_]*`.
 - **Single level, no recursion:** a `${…}` appearing inside a `[vars]` value is
   *not* itself expanded — vars cannot reference vars. Predictable, no cycles.
+- **Implicit `${HOME}` / `${USER}`** are always available, seeded from the host
+  (`HOME` = `~`, `USER` = `$USER`); an explicit `[vars]` entry of the same name
+  overrides them. They exist mainly for `[env]` values, which are literal (`~` is
+  not expanded — §7.3): `${HOME}` lets you write a home-relative path the
+  consuming tool won't expand itself (e.g. `GIT_CONFIG_GLOBAL`). Because host
+  `HOME`/`USER` equal the container's (§3 identity), one value is correct on both
+  sides. (A *bare* `$HOME` is still left literal — brace form only.)
 - An undefined `${NAME}` is a `ConfigError` naming the key (never silently
   passed through).
 - `[vars]` is consumed at parse time only; it has no runtime effect and is not
@@ -275,7 +282,9 @@ env  = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }  # [contexts.env] sub-t
   are conventionally UPPERCASE, so no real collision). Everything else in the
   table is a literal pair.
 - **`${VAR}` (§7.1) expands in literal values** (the pre-pass walks all strings);
-  `~` is **not** expanded (env values are not paths). `forward` entries are bare
+  `~` is **not** expanded (env values are not paths). For a home-relative value,
+  use the implicit **`${HOME}`** (§7.1) — e.g.
+  `GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"`. `forward` entries are bare
   names — no `${}`, untouched.
 - **Validation:** env names must match `[A-Za-z_][A-Za-z0-9_]*`; values must be
   strings; `forward` must be a list of strings; `HOME`/`USER`/`PATH` are

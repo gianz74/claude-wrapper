@@ -358,7 +358,7 @@ surface it rather than guessing.
   change** (point `provision_script` at a temp file, rewrite its bytes → different
   stamp with the same `Config` shape).
 
-- [ ] **T18 — HOME-relative paths in `[env]` values (`config.py` + DESIGN §7.1/§7.3).**
+- [x] **T18 — HOME-relative paths in `[env]` values (`config.py` + DESIGN §7.1/§7.3).**
   Close the usability footgun found on 2026-05-24: there is **no ergonomic way to
   put a `$HOME`-relative path into an `[env]` value.** `[env]` values are literal
   by design (§7.3: "`~` is **not** expanded — env values are not paths"), the
@@ -1626,3 +1626,51 @@ identical, just rewriting the script's bytes) — plus schema-bump coverage and 
 read/write + drift-cycle round-trips (incl. a runtime-only `[env]` edit staying a
 match). Clean import; no daemon interaction so no throwaway run (mirrors T15).
 **Project is now T1–T17 complete (the full TASKS.md list).**
+
+### 2026-05-24 — T18: HOME-relative paths in `[env]` values (option (b))
+
+**Design call (user-approved):** option **(b)** — predefine implicit `${HOME}` /
+`${USER}` in the §7.1 `${VAR}` pre-pass — over (a) doc-only and (c) `~`-in-env.
+Keeps the "env ≠ path / no `~`" stance intact (it rides the existing brace
+mechanism), works on both sides of every mount (host HOME/USER == container's,
+§3), and is purely additive sugar.
+
+**Changed:**
+- `config.py`: added `_implicit_vars()` (`HOME = os.path.expanduser("~")`,
+  `USER = os.environ.get("USER") or basename(home)`); seeded it in `parse_config`
+  as `variables = {**_implicit_vars(), **_parse_vars(...)}` so an explicit
+  `[vars]` entry of the same name still wins. Updated module docstring, the
+  pre-pass comment, and `_DEFAULT_CONFIG_TOML` (the `[vars]` note + a
+  `GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"` example in `[env]`).
+- `DESIGN.md`: §7.1 gained an implicit-`${HOME}`/`${USER}` bullet; §7.3's
+  "`~` not expanded" bullet now points at `${HOME}` for home-relative values.
+- `tests/test_config.py`: +4 tests (home var in an `[env]` value; `${USER}`;
+  `[vars]` override of implicit `HOME`; undefined `${NOPE}` still raises even with
+  the seeds present).
+
+**Decisions / gotchas:**
+- **No `SCHEMA_VERSION` bump, no build-id impact** (as the task predicted): a
+  config that doesn't reference `${HOME}`/`${USER}` parses byte-identically
+  (`test_varless_config_parses_identically` still green), and a config that *does*
+  use them in a mount path resolves to the same string the build-id already
+  hashes — just like any `${VAR}`. Env values are runtime-only regardless.
+- **Bare `$HOME` is still literal** — only the brace form `${HOME}` resolves
+  (`test_bare_dollar_name_left_literal` unchanged). This is the documented
+  distinction; don't "fix" bare `$` to expand.
+- **`parse_config` now reads `os.environ`/`~`** for the seeds. It already did via
+  `_expand` (`~` expansion), so this isn't new impurity; tests that don't
+  reference the vars are unaffected (the seed dict is built but unused).
+- **Reserved-key check unaffected:** `HOME`/`USER`/`PATH` are still rejected as
+  `[env]` *keys* (`_check_env_name`); `${HOME}` is a *value* substitution — no
+  overlap, no contradiction.
+- **The original `.gitconfig` trigger** (the reason this task exists): a
+  single-file `~/.gitconfig` bind mount can't be `rename()`d over (EBUSY), so
+  `git config` needs a *directory* mount + `GIT_CONFIG_GLOBAL` pointing inside it.
+  Users now express that portably as `${HOME}/.config/git/config` in `[env]`.
+  The mount/`GIT_CONFIG_GLOBAL` setup itself is the user's `config.toml` concern,
+  not package code.
+
+**Verified:** `pytest -q` → **185 passed** (was 181; +4). Real parse from the
+repo root confirmed `GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"` →
+`/home/gianz/.config/git/config`. No daemon interaction, so no throwaway run.
+**Project is now T1–T18 complete.**

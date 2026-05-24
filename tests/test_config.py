@@ -275,6 +275,44 @@ path = "/data/${A}"
     assert cfg.mounts[0].path == "/data/${B}/x"
 
 
+def test_implicit_home_var_in_env_value(tmp_path):
+    # ${HOME} is seeded implicitly so a home-relative [env] value works even
+    # though env values are NOT ~-expanded (the §7.3 / T18 motivating case).
+    text = """\
+[env]
+GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.env["GIT_CONFIG_GLOBAL"] == os.path.expanduser("~") + "/.config/git/config"
+
+
+def test_implicit_user_var(tmp_path):
+    expected = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
+    text = '[[mounts]]\npath = "/srv/${USER}/data"\n'
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.mounts[0].path == f"/srv/{expected}/data"
+
+
+def test_implicit_home_overridable_by_vars(tmp_path):
+    # An explicit [vars] entry of the same name wins over the implicit seed.
+    text = """\
+[vars]
+HOME = "/custom"
+
+[[mounts]]
+path = "${HOME}/x"
+"""
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.mounts[0].path == "/custom/x"
+
+
+def test_undefined_var_still_raises_with_implicit_seeds(tmp_path):
+    # Seeding HOME/USER must not swallow a genuinely undefined ${NAME}.
+    text = '[[mounts]]\npath = "${HOME}/${NOPE}"\n'
+    with pytest.raises(ConfigError, match=r"undefined variable \$\{NOPE\}"):
+        load_config(_write(tmp_path, text))
+
+
 # --- mount groups + context `include` (DESIGN §7.2, TASKS T14) ---------------
 
 _CREDS_GROUP = """\
