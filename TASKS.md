@@ -358,6 +358,53 @@ surface it rather than guessing.
   change** (point `provision_script` at a temp file, rewrite its bytes → different
   stamp with the same `Config` shape).
 
+- [ ] **T18 — HOME-relative paths in `[env]` values (`config.py` + DESIGN §7.1/§7.3).**
+  Close the usability footgun found on 2026-05-24: there is **no ergonomic way to
+  put a `$HOME`-relative path into an `[env]` value.** `[env]` values are literal
+  by design (§7.3: "`~` is **not** expanded — env values are not paths"), the
+  `${VAR}` pre-pass (§7.1) only resolves names declared in `[vars]`, and the
+  consuming tool usually won't expand `~` either — so a natural
+  `GIT_CONFIG_GLOBAL = "~/.config/git/config"` is passed through verbatim and
+  breaks. This is also **inconsistent with mounts**, where `~` *is* expanded.
+  - **Trigger (real case):** fixing `git config` against a bind-mounted
+    `~/.gitconfig` (single-file mounts can't be `rename()`d over → `EBUSY`)
+    requires pointing git at a config inside a *directory* mount via
+    `GIT_CONFIG_GLOBAL`. Setting it with a leading `~` failed with
+    `could not lock config file ~/.config/git/config: No such file or directory`
+    — git treated `~` as a literal dir. An absolute path works; the gap is that
+    nothing lets the user write it portably.
+  - **This needs a DESIGN call first** (DESIGN.md is authoritative; §7.3 currently
+    *documents* the no-expansion behavior, so changing it is a design edit, not a
+    bugfix). Options:
+    - **(a) Doc-only / accept.** Keep literal semantics; just teach the footgun:
+      note in §7.3 + the `_DEFAULT_CONFIG_TOML` env example that values are literal
+      and a HOME-relative path must be written absolute or via a `[vars]` entry.
+      Lowest risk; user hardcodes `/home/<user>` (acceptable — config is
+      per-machine). No code change.
+    - **(b) Predefine `${HOME}`/`${USER}` as implicit `[vars]` (recommended).**
+      Seed the §7.1 pre-pass with `HOME`/`USER` (still overridable by an explicit
+      `[vars]` entry) so `GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"`
+      resolves. Stays inside the existing brace mechanism — **preserves the
+      "env ≠ path / no `~`" stance** — and, because host HOME == container HOME
+      (§3 identity), one value is correct on both sides. Bonus: works in mount
+      paths too (consistent). Watch: §7.1 raises on undefined `${NAME}`, so the
+      seeds must be injected *before* the undefined-name check; decide whether
+      `${HOME}` is also allowed in mount `from`/`path` (likely yes, harmless).
+    - **(c) `~`/`$HOME` expansion in env values.** Rejected unless scoped — it
+      contradicts §7.3 and would wrongly rewrite non-path values
+      (e.g. `PROMPT = "~/x"`).
+  - **Scope note:** this is a post-T17 enhancement, not a blocker — the wrapper
+    works today with an absolute `GIT_CONFIG_GLOBAL`. The `.gitconfig`
+    directory-mount pattern itself is the user's `config.toml` concern, not a
+    package change.
+  **Done when:** the design call is recorded in DESIGN §7.1/§7.3; if (b), a config
+  with `GIT_CONFIG_GLOBAL = "${HOME}/.config/git/config"` loads with `${HOME}`
+  resolved to the real home and an undefined `${NOPE}` still raises (seeds don't
+  swallow real errors), with a unit test covering both and the `_DEFAULT_CONFIG_TOML`
+  example refreshed; if (a), §7.3 + the default-config comment state the literal
+  rule and the absolute/`[vars]` workaround. No `SCHEMA_VERSION`/build-id impact
+  either way (env + `[vars]` are already runtime-only / pre-flattened per T17).
+
 ---
 
 ## Progress log
