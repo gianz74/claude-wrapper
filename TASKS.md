@@ -132,6 +132,41 @@ surface it rather than guessing.
   `mounts._is_within`; the `claude`-resolves-to-wrapper `$PATH` check given an
   injected `$PATH` + filesystem facts).
 
+- [ ] **T12 — Recreate stale instances on source rebuild (`lifecycle.py`).**
+  Close the gap where `setup` rebuilds tiers 1–2 but leaves existing tier-3
+  instances on the old rootfs, so a `[setup].packages` (or `provision_script` /
+  context-mount) change never reaches an already-created per-cwd instance until
+  it is manually deleted (DESIGN §4/§9/§10). Stamp each source with a build
+  identity and recreate drifted instances:
+  - **Stamp the source:** in `build_base` and `_build_template`, set a
+    `user.cw-build` key (epoch seconds, or a content hash of the inputs that
+    define the rootfs — packages + provision script + relevant config) on
+    `claude-base` / each `claude-sandbox-<ctx>`. Instances inherit it through
+    `incus copy` as their "built-from" marker; `_ensure_instance` must not
+    overwrite it (it already only sets role/context).
+  - **Detect + recreate on the warm path:** in `_ensure_instance`
+    (`lifecycle.py:799`), before reusing an existing instance, compare its
+    inherited `user.cw-build` against the *current* `user.cw-build` of its
+    source (`BASE`, or the context template). On mismatch, delete and fall
+    through to the cold CoW path. **Respect the T10 liveness guard** — never
+    yank an instance out from under a live `claude` session
+    (`_has_live_session`); if a stale instance is live, warn + reuse it this run
+    (it recreates on the next idle run).
+  - **Decide lazy vs. eager** (surface if it needs a design call): lazy
+    recreation in `_ensure_instance` only rebuilds instances you actually use;
+    the alternative is `setup`/`reap` proactively deleting every instance whose
+    `cw-build` predates its source. Lazy keeps the §15.2 hot-path budget
+    untouched on the common (non-drifted) case — a single extra tag read folded
+    into the existing `instance_info`/`device_show` calls.
+  **Done when:** after `setup`, adding a package to `[setup].packages` and
+  re-running the wrapper in a dir whose instance **already exists** recreates
+  that instance and the new package is present inside (the 2026-05-24 scenario:
+  `git` absent from a pre-existing `claude-sandbox-personal-<hash>`); an
+  unchanged-config re-run does **not** recreate (no `cw-build` drift) and stays
+  within the §15.2 daemon-call budget; a stale instance with a live session is
+  left running and reused. Unit-test the pure drift decision (instance build-id
+  vs. source build-id → recreate?) with injected tag values.
+
 ---
 
 ## Progress log
@@ -860,3 +895,38 @@ Cleaned up — only `claude-base` STOPPED remains. **Project is now feature-comp
 (T1–T11 done).** Not exercised here: the §15.1 `@`-username leg (host is
 gianz/1000) and an end-to-end run after a real `setup`-with-launcher + a
 user-created `claude` shim (mechanism fully verified above).
+
+### 2026-05-24 — T12 added (stale-instance recreation gap; NOT yet implemented)
+
+**Context:** User added `git` to `[setup].packages`, ran `setup` (which rebuilt
+base + templates *with* git), then launched the wrapper in `~/Devel/claude-wrapper`
+(the `personal` context) — `git` was absent inside. Investigation confirmed the
+per-cwd instance `claude-sandbox-personal-4ed1aa79` was created 2026-05-24 11:17,
+**before** the base rebuild (11:29) and template rebuild (11:32), and is a CoW of
+the *older* (no-git) base. Both `claude-base` and `claude-sandbox-personal` have
+git (verified via `incus file pull` of the 4 MB binary — note `… /dev/null` as the
+pull target gives false "missing" results on real files; pull to a temp file);
+only the tier-3 instance was stale (had `jq` from the earlier base, not `git`).
+
+**Root cause:** `setup` rebuilds tiers 1–2 (delete+recreate) and runs `reap`, but
+`reap`/`plan_reap` only stop-idle / delete-by-age|LRU — there is no "instance is
+older than its source" notion. `_ensure_instance` (`lifecycle.py:799`) only
+CoW-copies when the instance is *missing*; an existing instance is reused with no
+staleness check, and instances carry no build-version tag (only `cw-role` /
+`cw-context` / `last-used`). So a config edit updates base+templates via the
+stamp-drift auto-setup, but the new rootfs **never propagates to already-created
+instances**. → T12 fixes this (stamp the source `user.cw-build`, recreate drifted
+instances on the warm path).
+
+**Immediate remediation done (host, not code):** deleted all four pre-rebuild
+tier-3 instances — `claude-sandbox-{default-74e5c3d8, personal-4ed1aa79,
+api-8f46f7c4, api-cba3cd75}` (all created before the 11:29 base rebuild). They
+recreate fresh (with git) on next use; `claude-base` + templates
+`claude-sandbox-{personal,api}` left intact and STOPPED.
+
+**Open design call for the T12 session:** lazy recreation in `_ensure_instance`
+vs. eager deletion in `setup`/`reap`; what to stamp into `user.cw-build` (epoch
+vs. content hash); the liveness-guard interaction (don't yank a live session).
+May warrant a short design amendment (§4/§9/§10) before coding, à la T11.
+
+**Verified:** none (investigation + task draft only; no code/DESIGN changed).
