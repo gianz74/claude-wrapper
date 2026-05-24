@@ -5,9 +5,11 @@ call (dependency-injected, so the core is unit-testable):
 
 * :func:`resolve_context` — longest-prefix match of the cwd over every
   context's ``when`` list (OR semantics), config order breaking ties (§6).
-* :func:`compute_scope` — the broadest covering ``[[contexts.mounts]]`` host
-  path → the git project root → the literal cwd, with the *subsumption* flag
-  (no separate project mount when the cwd is already inside a context mount; §5).
+* :func:`compute_scope` — when the cwd is inside *any* of the context's mounts
+  the scope is the *context* token ``ctx:<name>`` (all subsumed cwds of a context
+  share one instance, since each instance CoWs from the one template exposing the
+  *union* of the context's mounts); otherwise the git project root → the literal
+  cwd, with the *subsumption* flag (no separate project mount when subsumed; §5).
 * :func:`check_cwd_allowed` — the refuse-guard (cwd at/under any *alias*
   ``from``/``path``) and the cwd denylist (``$HOME`` itself, ``/`` and the
   system roots; §8). Raises :class:`RefuseError` with a clear message.
@@ -119,21 +121,22 @@ def resolve_context(cwd: str, contexts: tuple[Context, ...]) -> Context | None:
 # --- scope keying + subsumption (DESIGN §5) ----------------------------------
 
 
-def _broadest_covering_mount(cwd: str, context: Context | None) -> MountSpec | None:
-    """The broadest of *context*'s mounts that contains *cwd*, else ``None``.
+def _is_subsumed(cwd: str, context: Context | None) -> bool:
+    """True if *cwd* lies inside any of *context*'s mounts (DESIGN §5).
 
-    "Broadest" = the largest subtree = the shortest ``path`` (DESIGN §5): keying
-    on it makes every cwd under that mount share one instance. Only context
-    mounts count (global mounts are auth/config baked into base, never a
-    workspace). The refuse-guard has already excluded any cwd under an *alias*,
-    so a covering mount is always a parity mount (``path`` == host backing).
+    Only context mounts count (global mounts are auth/config baked into base,
+    never a workspace). When subsumed, every cwd of the context shares **one**
+    instance keyed on the *context* (not the individual covering mount): all of a
+    context's instances CoW from the one ``claude-sandbox-<ctx>`` template, which
+    bakes in the *union* of the context's mounts, so they are byte-identical in
+    blast radius — keying per covering mount would only fork redundant instances
+    (the multi-disjoint-mount waste this rule fixes). The refuse-guard has already
+    excluded any cwd under an *alias*, so a covering mount is always a parity
+    mount (``path`` == host backing).
     """
     if context is None:
-        return None
-    covering = [m for m in context.mounts if _is_within(cwd, m.path)]
-    if not covering:
-        return None
-    return min(covering, key=lambda m: len(_norm(m.path)))
+        return False
+    return any(_is_within(cwd, m.path) for m in context.mounts)
 
 
 def compute_scope(
@@ -144,14 +147,20 @@ def compute_scope(
 ) -> tuple[str, bool]:
     """Return ``(scope, add_project_mount)`` for *cwd* under *context* (DESIGN §5).
 
-    scope = the broadest covering context mount (subsumed ⇒ no project mount) →
-    else the git project root → else the literal cwd. *project_root_fn* maps a
-    cwd to its project root (or ``None``); it defaults to :func:`git_project_root`
-    and is injectable to keep the logic unit-testable without shelling out.
+    scope = the context token ``ctx:<name>`` when the cwd is inside any of the
+    context's mounts (subsumed ⇒ no project mount; all subsumed cwds of a context
+    share one instance) → else the git project root → else the literal cwd.
+    *project_root_fn* maps a cwd to its project root (or ``None``); it defaults to
+    :func:`git_project_root` and is injectable to keep the logic unit-testable
+    without shelling out.
+
+    The ``ctx:`` token is **only ever hashed** (``add_project_mount`` is ``False``
+    in that branch, so the run path never treats the scope as a host path); the
+    prefix keeps it disjoint from the absolute-path scopes of the other branches.
     """
-    cover = _broadest_covering_mount(cwd, context)
-    if cover is not None:
-        return _norm(cover.path), False  # subsumed: cwd already inside this mount
+    if _is_subsumed(cwd, context):
+        # context is not None here (_is_subsumed is False for the default context).
+        return f"ctx:{context.name}", False  # subsumed: one shared per-context instance
     fn = git_project_root if project_root_fn is None else project_root_fn
     root = fn(cwd)
     return _norm(root or cwd), True

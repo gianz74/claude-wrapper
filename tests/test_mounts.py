@@ -10,6 +10,7 @@ injected via ``project_root_fn``.
 import pytest
 
 from claude_wrapper.config import Config, Context, MountSpec
+from claude_wrapper.lifecycle import _template_name
 from claude_wrapper.mounts import (
     DEFAULT_CONTEXT,
     RefuseError,
@@ -101,27 +102,56 @@ def test_resolve_exact_length_tie_takes_config_order():
 # --- scope keying + subsumption (§5, §15.4) ----------------------------------
 
 
-def test_covering_mount_subsumes_and_shares_instance():
-    # §15.4: a context mounting ~/work; A and B under it → same scope,
-    # no project mount, same instance hash.
-    c = ctx("wk", "/home/u/work", mounts=[mount("/home/u/work")])
-    scope_a, add_a = compute_scope("/home/u/work/A", c, project_root_fn=lambda _: None)
-    scope_b, add_b = compute_scope("/home/u/work/B", c, project_root_fn=lambda _: None)
-    assert scope_a == scope_b == "/home/u/work"
-    assert add_a is False and add_b is False
-    assert scope_hash(scope_a) == scope_hash(scope_b)
+def test_disjoint_covering_mounts_share_one_instance():
+    # Revised §15.4: a context mounting two *disjoint* trees (~/work and
+    # ~/workspace). cwds under either — A, B under work, C under workspace —
+    # all key on the context token, so one shared instance, no project mount.
+    c = ctx(
+        "api",
+        ["/home/u/work", "/home/u/workspace"],
+        mounts=[mount("/home/u/work"), mount("/home/u/workspace")],
+    )
+    none = lambda _: None
+    scope_a, add_a = compute_scope("/home/u/work/A", c, project_root_fn=none)
+    scope_b, add_b = compute_scope("/home/u/work/B", c, project_root_fn=none)
+    scope_c, add_c = compute_scope("/home/u/workspace/C", c, project_root_fn=none)
+    assert scope_a == scope_b == scope_c == "ctx:api"
+    assert add_a is False and add_b is False and add_c is False
+    assert scope_hash(scope_a) == scope_hash(scope_b) == scope_hash(scope_c)
 
 
-def test_broadest_covering_mount_chosen():
-    # Nested mounts both cover the cwd → the broadest (shortest path) wins.
+def test_nested_covering_mounts_collapse_to_one_instance():
+    # Nested mounts (~/work + ~/work/foo) both cover the cwd; keying on
+    # the context (not the individual mount) still collapses to a single instance.
     c = ctx(
         "nested",
         "/home/u/work",
-        mounts=[mount("/home/u/work/special"), mount("/home/u/work")],
+        mounts=[mount("/home/u/work/foo"), mount("/home/u/work")],
     )
-    scope, add = compute_scope("/home/u/work/special/x", c, project_root_fn=lambda _: None)
-    assert scope == "/home/u/work"
-    assert add is False
+    none = lambda _: None
+    deep, add_deep = compute_scope("/home/u/work/foo/x", c, project_root_fn=none)
+    shallow, add_shallow = compute_scope("/home/u/work/bar", c, project_root_fn=none)
+    assert deep == shallow == "ctx:nested"
+    assert add_deep is False and add_shallow is False
+
+
+def test_subsumed_scope_token_is_context_constant_not_template_name():
+    # (4) The subsumed token is constant per context, `ctx:`-prefixed (so it can't
+    # collide with a real absolute-path scope), and is NOT the bare template name
+    # — the instance name appends scope_hash, so it never equals the template.
+    c = ctx("api", "/home/u/work", mounts=[mount("/home/u/work")])
+    none = lambda _: None
+    t1, _ = compute_scope("/home/u/work/A", c, project_root_fn=none)
+    t2, _ = compute_scope("/home/u/work/deep/sub", c, project_root_fn=none)
+    assert t1 == t2 == "ctx:api"  # constant per context
+    assert t1.startswith("ctx:") and not t1.startswith("/")
+    assert t1 != _template_name("api")  # != bare template `claude-sandbox-api`
+    # its hash is disjoint from any real-path scope's hash (no instance collision)
+    path_scope, add = compute_scope(
+        "/home/u/elsewhere/repo", None, project_root_fn=lambda _: "/home/u/elsewhere/repo"
+    )
+    assert add is True
+    assert scope_hash(t1) != scope_hash(path_scope)
 
 
 def test_scope_falls_back_to_project_root():
@@ -224,7 +254,7 @@ def test_resolve_covering_mount_resolution():
     r = resolve("/home/u/work/A", cfg, home=HOME, project_root_fn=lambda _: None)
     assert isinstance(r, Resolution)
     assert r.context_name == "wk"
-    assert r.scope == "/home/u/work"
+    assert r.scope == "ctx:wk"
     assert r.add_project_mount is False
 
 

@@ -218,7 +218,7 @@ surface it rather than guessing.
   Unit tests cover include-order, inline override, unknown-group, and the
   build-id sensitivity.
 
-- [ ] **T15 — Context-keyed scope dedup (`mounts.py`, DESIGN §5).** Fix the
+- [x] **T15 — Context-keyed scope dedup (`mounts.py`, DESIGN §5).** Fix the
   multi-covering-mount duplication: a context with two *disjoint* covering mounts
   (e.g. `api` mounting both `~/work` and `~/workspace`) currently forks one
   instance **per covering mount** even though all of that context's instances CoW
@@ -1301,3 +1301,54 @@ user didn't ask for.
 
 **Verified:** none — design + task draft only. No code changed; `DESIGN.md`
 (§5 rewrite + §15.4) and `TASKS.md` (T15 + this entry) only.
+
+### 2026-05-24 — T15: Context-keyed scope dedup (`mounts.py`)
+
+**Changed (`mounts.py` only — pure logic, confined to the scope layer; nothing
+downstream touched, exactly the design intent):**
+- Replaced `_broadest_covering_mount(cwd, ctx) -> MountSpec | None` with the
+  predicate `_is_subsumed(cwd, ctx) -> bool` (`any(_is_within(cwd, m.path) …)`).
+  "Broadest" no longer matters — only *whether* a covering mount exists.
+- `compute_scope`: the subsumed branch now returns `(f"ctx:{context.name}",
+  False)` instead of `(_norm(cover.path), False)`. The non-subsumed fall-through
+  (git project root → cwd, `add_project_mount=True`) is **unchanged** — that is
+  the §15.3 per-cwd isolation path, untouched.
+- Updated the module + `compute_scope` docstrings to the context-keying rule.
+
+**Decisions / gotchas for the future:**
+- **Why a non-path scope token is safe here:** the `ctx:<name>` string is **only
+  ever hashed** — it's returned only in the subsumed branch where
+  `add_project_mount=False`, so T8 never uses the scope as a project-mount host
+  path (it only `scope_hash`es it into the instance-name suffix). The `ctx:`
+  prefix keeps it disjoint from the absolute-path scopes of the non-subsumed
+  branch (all `/…`), so a subsumed instance can never collide-by-hash with a
+  path-scoped one of the same context (the mixed case: a context whose `when`
+  covers a dir its mounts don't, e.g. a parity mount + an extra `when` prefix).
+- **No `SCHEMA_VERSION` bump** (per design): this is instance-naming logic, not a
+  config-shape or template change, so the §10 stamp does **not** drift and no
+  rebuild/auto-setup is forced. `mounts.py` doesn't even reference the schema.
+- **Orphaned old-named instances:** any existing `…-<hash(~/work)>` /
+  `…-<hash(~/workspace)>` duplicates from before this change are simply not
+  matched by the new `…-<hash(ctx:<name>)>` name. They hold no unique state
+  (files live on host bind-mounts), so the reaper/`gc` clears them on age/LRU; a
+  one-off **`claude-wrapper gc`** removes them immediately if the user wants the
+  disk back now. The real `api` context (the motivating case: `~/work` +
+  `~/workspace`) will, on next launch under either tree, key on `ctx:api` and use
+  a single shared instance.
+- **No integration run needed** (and none done): the change is pure naming logic
+  with no daemon interaction; the instance-creation path (T8) that consumes the
+  scope is unchanged and already verified. Done-when is unit-test-only.
+
+**Verified:** `python3 -m pytest -q` → **150 passed** (149 prior − 2 replaced
+covering-mount tests + 3 new). The four Done-when cases: (1)
+`test_disjoint_covering_mounts_share_one_instance` — disjoint `~/work` +
+`~/workspace`, cwds `A`/`B`/`C` all → `ctx:api`, same hash, `add_project_mount`
+False; (2) `test_nested_covering_mounts_collapse_to_one_instance` — nested
+`~/work` + `~/work/foo` still one instance; (3)
+`test_per_cwd_isolation_distinct_instances` (kept) — ssh-only non-covering
+context still yields distinct project-root scopes/hashes with `add_project_mount`
+True per project (§15.3 preserved); (4)
+`test_subsumed_scope_token_is_context_constant_not_template_name` — token
+constant per context, `ctx:`-prefixed (not a path), and `!= _template_name(ctx)`,
+with a hash disjoint from a real-path scope. **Project is now T1–T15 complete
+(the full TASKS.md list).**
