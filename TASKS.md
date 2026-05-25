@@ -1885,3 +1885,30 @@ container's real `/etc/subuid` (`ubuntu:100000:65536`, no root range → the exa
 barney symptom), `_check_incus_initialised()` renders correctly for a mocked
 empty-pool/device-less-profile incus and passes silently for a healthy one.
 **Project is now T1–T20 complete — the full TASKS.md list.**
+
+### 2026-05-25 — Post-T20: claude-shadow cwd guard (`mounts.check_cwd_allowed`)
+
+Ad-hoc fix (not a numbered task; user-requested, implemented in one context).
+**Gap:** the setup-time claude-shadow guard (`lifecycle._check_no_claude_shadow`)
+only inspects *configured* `[[mounts]]`. The **per-cwd project mount** is
+home-parity, so launching from a cwd at/above the in-container claude tree would
+shadow it identically — and `check_cwd_allowed` never covered `~/.local*`. This
+is the runtime twin of that guard. Surfaced from the user's recollection that we
+"wanted to prevent running under `~/.local`"; the design as written never did.
+- **Rule (DESIGN §8 cwd-boundary, amended):** deny `~/.local` and `~/.local/share`
+  **exact**, `~/.local/share/claude` **at/under**. Only mounting the two parents
+  *whole* shadows claude, so their other children stay legal cwds — `~/.local/bin`
+  (launcher PATH owns it), `~/.local/state`, `~/.local/share/<other>`. Inside the
+  install dir is denied too (a parity mount there masks the version files — the
+  user's explicit choice over pure exact-match).
+- **Why exact for the parents:** at/under would needlessly forbid `~/.local/bin`
+  etc.; the shadow only happens when the *whole* parent is the mount root.
+- `LAUNCHER_DIR` (`/usr/local/lib/claude-wrapper/bin`) needs no entry — already
+  under the `/usr` system-root denial.
+- **Done when:** new `test_mounts.py` cases — 3 deny groups (incl. the
+  `claude/versions/<v>` inner case) + an allow group covering `~/.local/bin[/sub]`,
+  `~/.local/state/x`, `~/.local/share/other`, and the `~/.localx` non-prefix.
+
+**Verified:** `python3 -m pytest -q` → **206 passed** (was 195; +11 new). No
+rootfs/config-shape change → no `SCHEMA_VERSION`/build-id impact; pure host-side
+launch guard.

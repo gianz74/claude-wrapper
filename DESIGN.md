@@ -350,8 +350,15 @@ env  = { DEPLOY_ENV = "work", forward = ["WORK_TOKEN"] }  # [contexts.env] sub-t
   **alias** (`from`/`path` of a `from`-bearing entry) — you should never use a
   remapped credential store as a workspace.
 - **cwd boundary (denylist):** any cwd allowed *except* `$HOME` itself, the
-  alias dirs above, and system roots (`/ /etc /usr /bin /boot /dev /proc /sys
-  /run /var`). Out-of-home project dirs are permitted — the per-cwd isolation
+  alias dirs above, system roots (`/ /etc /usr /bin /boot /dev /proc /sys
+  /run /var`), and the in-container claude install — `~/.local` and
+  `~/.local/share` (exact) plus `~/.local/share/claude` (at/under). Those three
+  are the **cwd-side twin of the claude-shadow guard below**: the per-cwd mount
+  is home-parity, so a cwd that *contains* the claude tree (`~/.local`,
+  `~/.local/share`) or *is/under* `~/.local/share/claude` would bind the host
+  over the container's own claude and break `exec claude`. `~/.local/bin` and
+  every other `~/.local` child stay legal cwds (only mounting the parents *whole*
+  shadows claude). Out-of-home project dirs are permitted — the per-cwd isolation
   earns this flexibility.
 - **claude-shadow guard (setup-time):** `setup` refuses if any configured mount's
   container-side `path` covers the in-container claude — i.e. is at or above

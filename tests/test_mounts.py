@@ -246,6 +246,45 @@ def test_out_of_home_project_allowed():
     check_cwd_allowed("/tmp/scratch/proj", home=HOME, cfg=Config())
 
 
+# --- claude-shadow cwd guard (§8): per-cwd mount must not cover the install ---
+
+
+@pytest.mark.parametrize("cwd", ["/home/u/.local", "/home/u/.local/"])
+def test_refuse_dot_local_exact(cwd):
+    with pytest.raises(RefuseError, match="claude install"):
+        check_cwd_allowed(cwd, home=HOME, cfg=Config())
+
+
+@pytest.mark.parametrize("cwd", ["/home/u/.local/share", "/home/u/.local/share/"])
+def test_refuse_dot_local_share_exact(cwd):
+    with pytest.raises(RefuseError, match="claude install"):
+        check_cwd_allowed(cwd, home=HOME, cfg=Config())
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    ["/home/u/.local/share/claude", "/home/u/.local/share/claude/versions/1.2.3"],
+)
+def test_refuse_claude_install_at_or_under(cwd):
+    # The install dir itself and anything inside it (e.g. version files).
+    with pytest.raises(RefuseError, match="claude install"):
+        check_cwd_allowed(cwd, home=HOME, cfg=Config())
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    [
+        "/home/u/.local/bin",          # beside the tree — launcher PATH owns it
+        "/home/u/.local/bin/sub",
+        "/home/u/.local/state/x",
+        "/home/u/.local/share/other",  # sibling of claude under share — fine
+        "/home/u/.localx",             # not a component prefix of ~/.local
+    ],
+)
+def test_other_dot_local_children_allowed(cwd):
+    check_cwd_allowed(cwd, home=HOME, cfg=Config())  # must not raise
+
+
 # --- orchestrator ------------------------------------------------------------
 
 

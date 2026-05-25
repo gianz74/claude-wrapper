@@ -11,8 +11,9 @@ call (dependency-injected, so the core is unit-testable):
   *union* of the context's mounts); otherwise the git project root → the literal
   cwd, with the *subsumption* flag (no separate project mount when subsumed; §5).
 * :func:`check_cwd_allowed` — the refuse-guard (cwd at/under any *alias*
-  ``from``/``path``) and the cwd denylist (``$HOME`` itself, ``/`` and the
-  system roots; §8). Raises :class:`RefuseError` with a clear message.
+  ``from``/``path``) and the cwd denylist (``$HOME`` itself, ``/``, the system
+  roots, and the in-container claude install — ``~/.local``/``~/.local/share``
+  exact, ``~/.local/share/claude`` at/under; §8). Raises :class:`RefuseError`.
 * :func:`resolve` — the orchestrator the run path (T8) calls: guard → context →
   scope, returning a :class:`Resolution`.
 * :func:`scope_hash` — the stable ``hash8(scope)`` keying instances; T8 joins it
@@ -231,8 +232,14 @@ def check_cwd_allowed(cwd: str, *, home: str, cfg: Config) -> None:
     """Raise :class:`RefuseError` if *cwd* is a disallowed workspace (DESIGN §8).
 
     Denied: ``$HOME`` itself and ``/`` (exact), anything at/under a system root,
-    and anything at/under an *alias* ``from``/``path`` (the refuse-guard). A
-    normal project dir — in-home subdir or out-of-home — passes.
+    anything at/under an *alias* ``from``/``path`` (the refuse-guard), and the
+    in-container claude install — ``~/.local`` and ``~/.local/share`` (exact)
+    plus ``~/.local/share/claude`` (at/under). The last three are the cwd-side
+    twin of the setup-time claude-shadow guard (:func:`lifecycle._check_no_claude_shadow`):
+    the per-cwd mount is home-parity, so a cwd that *contains* the claude tree
+    (``~/.local``/``~/.local/share``) or *is/under* it would bind the host over
+    the container's own claude and silently break ``exec claude``. A normal
+    project dir — in-home subdir (incl. ``~/.local/bin``) or out-of-home — passes.
     """
     c = _norm(cwd)
 
@@ -249,6 +256,27 @@ def check_cwd_allowed(cwd: str, *, home: str, cfg: Config) -> None:
                 f"refusing to run inside the system directory {root} "
                 f"(cwd {cwd}); cd into a project directory."
             )
+    # claude-shadow (cwd side, §8): refuse cwds whose home-parity mount would
+    # cover the in-container claude tree. ~/.local and ~/.local/share are
+    # exact-match denials (only mounting them *whole* shadows claude — their
+    # other children, e.g. ~/.local/bin, are fine workspaces); ~/.local/share/claude
+    # is denied at/under (mounting any part of it masks the install's own files).
+    local = os.path.join(home, ".local")
+    share = os.path.join(local, "share")
+    claude_share = os.path.join(share, "claude")
+    if c in (_norm(local), _norm(share)):
+        raise RefuseError(
+            f"refusing to run with the working directory set to {cwd} — its per-cwd "
+            "mount would shadow the container's own claude install "
+            "(~/.local/share/claude) and silently break `exec claude`. cd into a "
+            "project subdirectory (~/.local/bin and other ~/.local children are fine)."
+        )
+    if _is_within(c, claude_share):
+        raise RefuseError(
+            f"refusing to run inside the in-container claude install "
+            f"(~/.local/share/claude; cwd {cwd}) — its per-cwd mount would shadow "
+            "the container's own claude and silently break `exec claude`."
+        )
     for adir, role in _alias_dirs(cfg):
         if _is_within(c, adir):
             raise RefuseError(
