@@ -43,6 +43,24 @@ idle instance is a ~tens-of-MB userspace process tree, not a VM.
   `/etc/subuid` + `/etc/subgid`. `setup` detects a missing entry and **prints**
   the exact `sudo` command (never runs sudo itself):
   `echo 'root:<uid>:1' | sudo tee -a /etc/subuid /etc/subgid` + restart incus.
+- **Base root sub-id *range* prerequisite (distinct from the entry above):** the
+  idmap entry maps one id, but incus also needs root to own a *range* of ~65536
+  ids to build a normal **unprivileged** container; without it `incus launch`
+  dies with the opaque *"No uid/gid allocation configured. In this mode, only
+  privileged containers are supported"*. A lone `root:<uid>:1` idmap line passes
+  the entry check yet fails this one (count 1 ≪ a container's span). `setup`
+  detects a missing range on either file and prints the incus-documented fix —
+  `echo 'root:1000000:1000000000' | sudo tee -a /etc/subuid /etc/subgid` +
+  restart incus. The two lines coexist: `1000000..` is disjoint from a normal
+  (1000) or large LDAP uid, so both are independently needed and the idmap still
+  resolves.
+- **Initialised-incus prerequisite:** a fresh incus that never ran
+  `incus admin init` has no storage pool and a device-less `default` profile, so
+  a launch fails with *"No storage pool found for instance"*. `setup` probes for
+  this (empty storage-pool list / device-less `default` profile) and prints
+  `incus admin init --minimal` + re-run. All three checks **detect → instruct →
+  never mutate** (the `_check_subuid` idiom); they run in `setup` only (the run
+  path inherits the refusal via stamp-drift auto-`setup`).
 
 ## 4. Container hierarchy (3 tiers)
 
@@ -530,6 +548,12 @@ The rewrite is "done" when each of these passes:
     `[setup].packages` entry, a mount, **or a provision-script's content with
     `config.toml` byte-identical** — triggers exactly one auto-`setup`. No daemon
     calls are added to the warm path versus §15.2.
+14. **incus host preflight (§3):** on a host with the single `root:<uid>:1` idmap
+    entry but **no base sub-id range**, `setup` prints the
+    `root:1000000:1000000000` + restart instructions and exits cleanly (no opaque
+    incus error); on an **uninitialised** incus (no storage pool / device-less
+    `default` profile), `setup` prints `incus admin init`; a properly-configured
+    host is unaffected (preflight passes silently).
 
 ## 16. Open / deferred
 

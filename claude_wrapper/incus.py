@@ -133,6 +133,50 @@ def list_instances() -> list[dict]:
     return [i for i in data if isinstance(i, dict)] if isinstance(data, list) else []
 
 
+def storage_pools() -> list:
+    """Return configured storage pools (one daemon call). ``[]`` if none.
+
+    Used by the T20 setup-time host-readiness preflight to detect an
+    uninitialised incus (``incus admin init`` never run → empty list). JSON via
+    ``incus query`` per the zero-dep rule. A missing ``incus`` binary still
+    raises :class:`IncusError` (from :func:`_run`); a daemon error → ``[]``.
+    """
+    proc = _run(
+        ["query", "/1.0/storage-pools"],
+        capture=True,
+        check=False,
+        stdin_text=None,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def profile(name: str) -> dict | None:
+    """Return a profile's REST object (JSON) or ``None`` if absent/unreadable.
+
+    Used by the T20 preflight to inspect the ``default`` profile's ``devices``
+    (a device-less ``default`` is the uninitialised-incus signature).
+    """
+    proc = _run(
+        ["query", f"/1.0/profiles/{name}"],
+        capture=True,
+        check=False,
+        stdin_text=None,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        obj = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def container_exists(name: str) -> bool:
     return instance_info(name) is not None
 

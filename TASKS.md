@@ -437,6 +437,68 @@ surface it rather than guessing.
   when named in `[env].forward`. No `SCHEMA_VERSION`/build-id impact (env is
   runtime-only per T17).
 
+- [x] **T20 — Preflight incus host-readiness in `setup` (`lifecycle.py`, DESIGN §3).**
+  Close the gap where `setup` passes the existing subuid check but then dies at
+  `incus.launch(IMAGE, BASE)` (`lifecycle.py:470`) with incus's opaque
+  *"No uid/gid allocation configured. In this mode, only privileged containers
+  are supported"*. Discovered 2026-05-25 on Ubuntu Noble host `barney`: root owned
+  only the single `root:<uid>:1` idmap entry (which `_check_subuid` requires and
+  which `_subid_covered` happily confirms — count-1 covers the target) but **no
+  base unprivileged range**, so incus cannot build a normal unprivileged container.
+  A count-1 allocation is far too small for a container's ~65536-id span. Extend
+  the §3 "detect-and-instruct, never mutate" idiom (the `_check_subuid` pattern) to
+  catch this *before* launch and print the fix, instead of letting the raw incus
+  error through. Two detections, both setup-only (the run path inherits via
+  stamp-drift auto-setup; setup is not the §15.2 hot path, so a daemon call here is
+  fine — same licence as the T11 host checks):
+  - **(a) Missing base root subid range (the immediate bug — must-have).** Add a
+    pure predicate alongside `_subid_covered` (`lifecycle.py:98`) — e.g.
+    `_subid_range_present(path, *, min_count=65536) -> bool` — that returns True iff
+    some `root:start:count` line has `count >= min_count` (one container's idmap
+    span). This is **distinct** from `_subid_covered`: the latter asks "is *this*
+    uid mappable" (idmap prereq, count 1 ok); the former asks "can incus allocate a
+    *container's worth* of ids" (unprivileged-container prereq). If absent on either
+    `/etc/subuid` or `/etc/subgid`, instruct the incus-documented range and a
+    restart: `echo 'root:1000000:1000000000' | sudo tee -a /etc/subuid /etc/subgid`
+    + `sudo systemctl restart incus`. **Coexists with the single `root:<uid>:1`
+    entry** — `1000000..1001000000` is disjoint from a normal uid (1000) and from a
+    large LDAP uid (e.g. 1529911346 > 1.001e9), so both lines are independently
+    needed and neither overlaps; the idmap still resolves. Keep the two prereqs as
+    clearly-separate messages (or one consolidated "run these on the host" block
+    covering whatever is missing) so the user doesn't conflate the idmap entry with
+    the base range.
+  - **(b) Uninitialised incus (the *next* wall — should-have).** Observed on the
+    corp laptop the same day: `incus storage list` empty, `default` profile has no
+    devices, no managed network — i.e. `incus admin init` was never run, so a launch
+    would instead fail with *"No storage pool found for instance"*. Detect via a
+    cheap probe (reuse `incus query` per the T3 zero-dep rule, not YAML — e.g. an
+    empty storage-pool list or a device-less `default` profile) and, if
+    uninitialised, print `incus admin init --minimal` (or plain `incus admin init`)
+    + re-run. Refuse, do not mutate.
+  - **Wiring:** call the new preflight in `build_base` right after the existing
+    `_check_subuid(host_uid, host_gid)` (`lifecycle.py:463`) and before
+    `incus.launch` (`:470`). Either extend `_check_subuid` into a broader
+    `_check_incus_ready` or add a sibling — implementer's call; keep the idmap
+    single-entry check and the range check as separate predicates so each emits its
+    own targeted fix.
+  - **Needs a small DESIGN edit first:** §3 (lines ~42-45) currently documents only
+    the single-entry idmap prerequisite (`root:<uid>:1`) and assumes incus's base
+    root range exists from installation. Add the base-range prerequisite (and,
+    optionally, the `incus admin init` readiness note) to §3 so the authoritative
+    doc matches; add/extend a §15 acceptance row if one fits.
+  **Done when:** on a host with the single idmap entry but no base range, `setup`
+  prints the `root:1000000:1000000000` + restart instructions and exits cleanly
+  (no opaque incus error); on an uninitialised incus, `setup` prints the
+  `incus admin init` instruction and exits; a properly-configured host is
+  unaffected (preflight passes silently). DESIGN §3 records the base-range
+  prerequisite. Unit tests (pure, no daemon) cover `_subid_range_present`: a file
+  with only `root:<uid>:1` → False, a file with `root:1000000:1000000000` → True,
+  a file with both lines → True, a missing/unreadable file → False, and the
+  `count` boundary (`root:x:65535` → False, `root:x:65536` → True). The (b)
+  storage/profile probe is daemon I/O — verify by a throwaway/manual run per the
+  T3/T4 convention, not a unit test. No `SCHEMA_VERSION`/build-id impact (host
+  preflight, touches no rootfs or config shape).
+
 ---
 
 ## Progress log
@@ -1758,3 +1820,68 @@ longer forwarded on *any* machine until its real `config.toml` names them.
 default config re-parses cleanly (the `[env]` example stays commented →
 `forward=()`, `env={}`). No residual relocated-var references in `lifecycle.py`.
 **Project is now T1–T19 complete — the full TASKS.md list.**
+
+### 2026-05-25 — T20: Preflight incus host-readiness in `setup`
+
+**Design (recorded first, DESIGN §3 + §15.14):** §3 gained two new prerequisite
+bullets beyond the existing single-entry idmap check — a **base root sub-id
+*range*** (incus needs ~65536 ids for an unprivileged container; a lone
+`root:<uid>:1` idmap entry passes the entry check but fails this) and an
+**initialised incus** (`incus admin init` → a storage pool + a device-less
+`default` profile). Both follow the detect→instruct→never-mutate `_check_subuid`
+idiom. Added §15.14 acceptance row.
+
+**Changed (`lifecycle.py`):**
+- `_subid_range_present(path, *, min_count=65536) -> bool` — pure predicate
+  alongside `_subid_covered`; True iff some `root:start:count` line has
+  `count >= min_count`. Distinct from `_subid_covered` (count-1 idmap prereq).
+  Mirrors its owner filter (`root`/`0`) and OSError→False.
+- `_check_subid_range()` (a) — raises `SetupError` with
+  `echo 'root:1000000:1000000000' | sudo tee -a /etc/subuid /etc/subgid` +
+  restart if the range is absent on **either** file.
+- `_check_incus_initialised()` (b) — raises `SetupError` printing
+  `incus admin init --minimal` if there's no storage pool **or** a device-less
+  `default` profile (one daemon call each).
+- `_check_incus_ready()` — wraps (a)+(b); called in `build_base` **right after
+  `_check_subuid(host_uid, host_gid)` and before `incus.launch`** (line ~558).
+  Constants `_SUBID_BASE_RANGE` / `_CONTAINER_ID_SPAN=65536`.
+
+**Changed (`incus.py`):** added two zero-dep `incus query` probes —
+`storage_pools() -> list` (`/1.0/storage-pools`, `[]` on none/error) and
+`profile(name) -> dict|None` (`/1.0/profiles/<name>`). A missing `incus` binary
+still raises `IncusError` from `_run` (propagates to the CLI), a daemon error →
+empty/None (so the readiness check fails closed with our message, not a crash).
+
+**Decisions / gotchas:**
+- **Range `1000000:1000000000` coexists with the idmap entry** — disjoint from a
+  normal uid (1000, below start) and a large LDAP uid (e.g. 1529911346, above
+  the `1_001_000_000` end), so both `/etc/subuid` lines are independently needed
+  and the idmap still resolves. Documented in §3 + the `_SUBID_BASE_RANGE`
+  comment.
+- **Two separate predicates, two separate messages** (per the task) so the user
+  never conflates the count-1 idmap entry with the base range. `_check_subuid`
+  is untouched; `_check_incus_ready` is a sibling, not an extension.
+- **Daemon cost is setup-only.** `build_base` is called **only** from `setup()`
+  (confirmed: the warm run path never calls it), so the two new probe calls add
+  **zero** calls to the §15.2 hot path. `setup` is not the hot path, so a daemon
+  call there is fine (same licence as the T11 host checks).
+- **(b) fails closed:** if `storage_pools()`/`profile()` hit a daemon error they
+  return `[]`/`None`, so `_check_incus_initialised` raises our clear message
+  rather than letting an opaque incus error through later. A missing binary is
+  the one exception — it raises `IncusError` (also caught by the CLI).
+- **No `SCHEMA_VERSION`/build-id impact** — host preflight, touches no rootfs or
+  config shape (as the task predicted). `_config_stamp`/build-ids unchanged.
+
+**Verified:** `python3 -m pytest -q` → **195 passed** (was 187; +8 new in
+`tests/test_subid_range.py`): single idmap entry → False, base range → True, both
+lines → True, missing file → False, the count boundary (65535 → False,
+65536 → True), non-root owner ignored (the stock `ubuntu:100000:65536` case),
+`0` owner alias accepted, malformed lines skipped. **Daemon-side (b) probe not
+run here:** this session executes *inside* a sandbox container
+(`claude-sandbox-default-30edbc7d`, no `incus` on PATH), so the live preflight
+must be validated on the host — unit-test-only verification, like T15/T17/T19.
+Demonstrated the rendered messages directly: `_check_subid_range()` fires on this
+container's real `/etc/subuid` (`ubuntu:100000:65536`, no root range → the exact
+barney symptom), `_check_incus_initialised()` renders correctly for a mocked
+empty-pool/device-less-profile incus and passes silently for a healthy one.
+**Project is now T1–T20 complete — the full TASKS.md list.**

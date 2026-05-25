@@ -144,6 +144,100 @@ def _check_subuid(host_uid: int, host_gid: int) -> None:
     )
 
 
+# incus's documented base range for unprivileged containers (start 1_000_000,
+# count 1e9 → spans 1_000_000..1_001_000_000). Disjoint from a normal uid (1000,
+# below the start) and a large LDAP uid (e.g. 1_529_911_346, above the end), so
+# it coexists with the single `root:<uid>:1` idmap entry without overlap and the
+# idmap still resolves. A container needs ~65536 ids, far more than a count-1
+# idmap entry — which is why this is a separate prerequisite (DESIGN §3).
+_SUBID_BASE_RANGE = "root:1000000:1000000000"
+_CONTAINER_ID_SPAN = 65536
+
+
+def _subid_range_present(path: str, *, min_count: int = _CONTAINER_ID_SPAN) -> bool:
+    """True if *path* has a ``root:start:count`` line with ``count >= min_count``.
+
+    **Distinct from** :func:`_subid_covered`: that asks "is *this* uid mappable"
+    (the idmap prereq — a count of 1 suffices); this asks "can incus allocate a
+    *container's worth* of ids" (the unprivileged-container prereq). A host can
+    satisfy the former (a lone ``root:<uid>:1`` idmap entry) yet fail the latter
+    (no base range), in which case ``incus launch`` dies with the opaque "No
+    uid/gid allocation configured". (DESIGN §3.)
+    """
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        parts = line.split(":")
+        if len(parts) != 3:
+            continue
+        owner, _start, count = parts
+        if owner not in ("root", "0"):
+            continue
+        try:
+            c = int(count)
+        except ValueError:
+            continue
+        if c >= min_count:
+            return True
+    return False
+
+
+def _check_subid_range() -> None:
+    """Raise :class:`SetupError` if root lacks a base sub-id *range* (DESIGN §3).
+
+    Separate from :func:`_check_subuid` (the single-entry idmap check) so each
+    emits its own targeted fix. Detect → instruct → never mutate.
+    """
+    if _subid_range_present("/etc/subuid") and _subid_range_present("/etc/subgid"):
+        return
+    raise SetupError(
+        "incus needs a base root sub-id *range* to build an unprivileged "
+        "container, but /etc/subuid or /etc/subgid has none (a single "
+        "`root:<uid>:1` idmap entry is not enough — a container needs ~65536 "
+        "ids, so `incus launch` would fail with \"No uid/gid allocation "
+        "configured\").\nRun on the host, then re-run `claude-wrapper setup`:\n\n"
+        f"  echo '{_SUBID_BASE_RANGE}' | sudo tee -a /etc/subuid /etc/subgid\n"
+        "  sudo systemctl restart incus"
+    )
+
+
+def _check_incus_initialised() -> None:
+    """Raise :class:`SetupError` if incus was never ``incus admin init``-ed (§3).
+
+    An uninitialised incus has no storage pool and a device-less ``default``
+    profile, so a launch would fail with "No storage pool found for instance".
+    Probe both (one daemon call each); detect → instruct → never mutate.
+    """
+    has_pool = bool(incus.storage_pools())
+    default = incus.profile("default")
+    has_devices = bool(default and default.get("devices"))
+    if has_pool and has_devices:
+        return
+    raise SetupError(
+        "incus is not initialised (no storage pool / device-less `default` "
+        "profile) — `incus admin init` was never run, so a container launch "
+        "would fail with \"No storage pool found for instance\".\n"
+        "Run on the host, then re-run `claude-wrapper setup`:\n\n"
+        "  incus admin init --minimal"
+    )
+
+
+def _check_incus_ready() -> None:
+    """Setup-time host-readiness preflight beyond the idmap entry (DESIGN §3).
+
+    Catches the two prerequisites that, if missing, make ``incus launch`` die
+    with an opaque error rather than a clear instruction: a base root sub-id
+    *range* (a), and an initialised incus (b). Called right after
+    :func:`_check_subuid` in :func:`build_base`, before the launch. Setup-only
+    (the run path inherits the refusal via stamp-drift auto-``setup``); a daemon
+    call here is fine — ``setup`` is not the §15.2 hot path.
+    """
+    _check_subid_range()
+    _check_incus_initialised()
+
+
 # --- identity (DESIGN §3) ----------------------------------------------------
 
 # Rename the stock `ubuntu` user to the host $USER and move its home to the
@@ -461,6 +555,7 @@ def build_base(
     bind-mount sources), so each ``setup`` rebuilds it from scratch.
     """
     _check_subuid(host_uid, host_gid)
+    _check_incus_ready()  # base sub-id range + initialised incus (DESIGN §3)
 
     if incus.container_exists(BASE):
         print(f"Rebuilding {BASE} (delete + recreate)...")
